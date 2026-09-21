@@ -212,7 +212,23 @@ const $ = id => document.getElementById(id);
 const S = {
   game: null, playing: false, busy: false, timer: null,
   speed: 0, history: [], stat: null, bench: null, paint: 0,
+  seen: null, cycle: null, repeats: 0,
 };
+
+/* The model has no memory between moves, so a board it has already seen is a
+   board it will answer identically -- which shows up as the snake pacing a loop
+   forever. Detect that here and say so, instead of letting it look like a hang. */
+function noteCycle(g) {
+  if (!S.seen) { S.seen = Object.create(null); S.cycle = null; S.repeats = 0; }
+  const sig = g.snake.map(p => p[0] + "." + p[1]).join("|") + "#" + g.food.join(".");
+  const n = S.history.length;
+  if (S.seen[sig] === undefined) {
+    S.seen[sig] = n;
+  } else {
+    S.repeats++;
+    if (!S.cycle) S.cycle = { from: S.seen[sig], len: n - S.seen[sig] };
+  }
+}
 
 function setStatus(text, cls) {
   const c = $("c-status");
@@ -241,6 +257,9 @@ async function reset() {
     const g = await api("/api/new" + q);
     S.game = g;
     S.history = [];
+    S.seen = null;
+    S.cycle = null;
+    S.repeats = 0;
     $("c-policy").textContent = policy() === "model" ? "Laya 模型" : policy() + " 基线";
     setStatus(g.alive ? "就绪" : "结束");
     paint();
@@ -265,6 +284,7 @@ async function step() {
     S.game = g;
     if (g.last) S.history.push(Object.assign({}, g.last, { fatal: g.fatal.slice() }));
     if (S.history.length > 500) S.history.shift();
+    noteCycle(g);
     tally(g);
   } catch (e) {
     setStatus("请求失败", "dead");
@@ -443,7 +463,11 @@ function drawDecision() {
   html += m("prompt", L.tokens + " tok");
   html += '</div>';
 
-  if (policy() === "model") {
+  if (S.cycle) {
+    html += `<div class="verdict">⚠ 陷入循环：这一步的盘面在第 ${S.cycle.from} 步出现过，
+      每 ${S.cycle.len} 步重复一次，已重复 ${S.repeats} 次。模型每次只看当前盘面、
+      没有记忆，所以看到同样的盘面就给出同样的答案。</div>`;
+  } else if (policy() === "model") {
     html += pickedFatal
       ? '<div class="verdict">模型选了会立刻结束游戏的方向（' + L.dir + '）</div>'
       : '<div class="verdict safe">这一步选得安全</div>';
@@ -513,6 +537,9 @@ function drawStats() {
     return `<span class="mv${died ? " died" : ""}" title="${tip}">${ARROW[L.dir]}</span>`;
   }).join("") + "</div>";
   html += '<div class="legend"><span>最近 60 步方向，红色=这一步会死</span></div>';
+  if (S.cycle) {
+    html += `<div class="verdict">循环：周期 ${S.cycle.len} 步（自第 ${S.cycle.from} 步起）</div>`;
+  }
   box.innerHTML = html;
 }
 

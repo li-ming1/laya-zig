@@ -93,6 +93,9 @@ const check = (label, ok) => {
   check('prompt panel filled', $('prompt').textContent.length > 10);
   check('five steps issued five requests', calls === 6);
   check('death is reported in the status chip', $('c-status').textContent.indexOf('墙') >= 0);
+  // the stub repeats the same board every step, so a cycle must be flagged
+  check('repeating board is reported as a cycle',
+        $('dec').innerHTML.indexOf('陷入循环') >= 0);
 
   try { await $('b-reset').onclick(); } catch (e) { errors.push('reset: ' + e.message); }
   await new Promise(r => setTimeout(r, 40));

@@ -94,6 +94,33 @@ fn layerNorm(x: []f32, w: []const f32, b: ?[]const f32) void {
 var g_threads: usize = 4;
 var g_debug: bool = false;
 
+/// `--dumpstats`: after every encoder layer, print a few numbers describing the
+/// hidden state, so a reference implementation can be diffed against this one
+/// layer by layer (see tools/refcheck.py). Only the first forward pass dumps.
+var g_dump_stats: bool = false;
+var g_fwd_count: usize = 0;
+
+/// Kept to short lines on purpose: tools/refcheck.py reads this after PowerShell
+/// has captured stderr, and PowerShell hard-wraps long lines at the console width.
+fn dumpStats(tag: []const u8, x: []const f32, L: usize) void {
+    var sum: f64 = 0;
+    var asum: f64 = 0;
+    for (x[0 .. L * D]) |v| {
+        sum += v;
+        asum += @abs(v);
+    }
+    std.debug.print("[dump] {s:<5} {d:.5} {d:.5} {d:.5} {d:.3} {d:.3}\n", .{ tag, x[0], x[1], x[2], sum, asum });
+}
+
+fn dumpIds(ids: []const u32) void {
+    var i: usize = 0;
+    while (i < ids.len) : (i += 8) {
+        std.debug.print("[dump] ids", .{});
+        for (ids[i..@min(i + 8, ids.len)]) |v| std.debug.print(" {d}", .{v});
+        std.debug.print("\n", .{});
+    }
+}
+
 const RangeJob = struct {
     ctx: *anyopaque,
     f: *const fn (*anyopaque, usize, usize) void,
@@ -1176,6 +1203,12 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
     // ---- embeddings + norm (layer 0 has no attn_norm; embeddings.norm is folded in)
     parallel(alloc, L, f, embedJob);
     parallel(alloc, L, f, normJob);
+    const dumping = g_dump_stats and g_fwd_count == 0;
+    if (dumping) {
+        std.debug.print("[dump] meta L={d} qtype={d}\n", .{ L, f.qtype });
+        dumpIds(f.ids);
+        dumpStats("emb", s.x, L);
+    }
     for (0..NL) |l| {
         const lay = &m.layers[l];
         var attn_in: []const f32 = s.x;
@@ -1207,10 +1240,17 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         parallel(alloc, L, f, mlpJob);
         linear(alloc, s.xn, s.mlp2, lay.wo2, null, L, D, INTER);
         parallel(alloc, L, f, addResJob);
+        if (dumping) {
+            var tag: [8]u8 = undefined;
+            const t = std.fmt.bufPrint(&tag, "l{d}", .{l}) catch "l?";
+            dumpStats(t, s.x, L);
+        }
     }
 
     for (0..L) |i| layerNorm(s.x[i * D ..][0..D], m.final_norm, null);
+    if (dumping) dumpStats("final", s.x, L);
     parallel(alloc, L, f, typeEmbJob);
+    if (dumping) dumpStats("temb", s.x, L);
 
     // ---- decision head: 2 pre-norm transformer layers, bidirectional
     for (0..HEAD_LAYERS) |l| {
@@ -1237,6 +1277,11 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         parallel(alloc, L, f, reluJob);
         linear(alloc, s.xn, s.ff, hl.lin2_w, hl.lin2_b, L, D, HEAD_FF);
         parallel(alloc, L, f, addResJob);
+        if (dumping) {
+            var tag: [8]u8 = undefined;
+            const t = std.fmt.bufPrint(&tag, "h{d}", .{l}) catch "h?";
+            dumpStats(t, s.x, L);
+        }
     }
 
     @memcpy(f.pooled, s.x[0..D]);
@@ -1251,6 +1296,14 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         rowDot(&h1, &mvec, m.scorer1_w);
         for (0..D) |d| h1[d] = gelu(h1[d] + m.scorer1_b[d]);
         f.logits[r] = rowDot1(&h1, m.scorer3_w) + m.scorer3_b[0];
+    }
+
+    if (dumping) {
+        std.debug.print("[dump] mark", .{});
+        for (f.markers) |v| std.debug.print(" {d}", .{v});
+        std.debug.print("\n[dump] logit", .{});
+        for (f.logits[0..K]) |v| std.debug.print(" {d:.5}", .{v});
+        std.debug.print("\n", .{});
     }
 
     if (g_debug) {
@@ -1289,6 +1342,7 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
     for (0..2) |i| a2[i] = rowDot1(&h256, m.act2_w[i * 256 ..][0..256]) + m.act2_b[i];
     softmax(&a2);
     f.act = a2;
+    g_fwd_count += 1;
 }
 
 // --------------------------------------------------------------------------- sequence
@@ -1867,6 +1921,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, a, "--selftest")) {
             selftest = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--dumpstats")) {
+            g_dump_stats = true;
             continue;
         }
         const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or

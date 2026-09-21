@@ -306,7 +306,10 @@ pub fn run(gpa: Allocator, io: std.Io, w: *std.Io.Writer, chooser: Chooser, name
     }
 
     for (0..cfg.games) |gi| {
-        try g.reset();
+        // Init already reset the board. Resetting again would draw a second food
+        // from the RNG, so `--seed N` here and `?seed=N` on the web would start
+        // from different positions.
+        if (gi > 0) try g.reset();
         while (g.alive and g.steps < cfg.max_steps) {
             var status: std.Io.Writer.Allocating = .init(gpa);
             defer status.deinit();
