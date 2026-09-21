@@ -1,0 +1,19 @@
+laya-zig
+Copyright 2026 wuyou
+
+This product includes the Laya decision model, developed by Convai Innovations:
+
+    Laya — System 1 decision models
+    https://github.com/NandhaKishorM/laya
+    https://huggingface.co/convaiinnovations/laya-multilingual
+
+    Licensed under the Apache License, Version 2.0.
+
+The model weights (model.safetensors, 614 MB), the tokenizer and the encoder
+configuration are NOT distributed with this repository. They are downloaded from
+the Hugging Face Hub and remain subject to the terms of the upstream project.
+
+This repository contains only an independent inference implementation written in
+Zig: the tokenizer, the mmBERT-base encoder forward pass, and the Laya decision
+head. The architecture follows the upstream reference implementation
+(`laya/common.py` and `transformers/models/modernbert/modeling_modernbert.py`).

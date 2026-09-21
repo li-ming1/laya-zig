@@ -25,8 +25,10 @@
 //!         --snake --prompt       print the board text the model is given
 //!         --size N --max-steps N --delay MS --seed N
 //!
-//! Validated against a NumPy re-implementation: identical layer-by-layer activations,
-//! logits and probabilities.
+//! Validated against an independent pure-Python reference implementation
+//! (tools/refcheck.py): layer-by-layer activations, logits and probabilities agree
+//! to ~1e-5. README.md documents that check and the two others (--selftest,
+//! tools/web-smoke.js).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -2065,7 +2067,13 @@ pub fn main(init: std.process.Init) !void {
     const json_text: []const u8 = if (json_path) |p| try readFile(aa, io, p) else DEMO_JSON;
     var parsed_q = try std.json.parseFromSlice(std.json.Value, aa, json_text, .{});
     const questions = try loadQuestions(aa, parsed_q.value);
-    const state: []const u8 = if (parsed_q.value.object.get("state")) |sv| (if (sv == .string) sv.string else "") else "";
+    // A non-string state is JSON-serialized, matching upstream's serialize_state().
+    // It used to fall back to "" here, so the upstream quickstart -- which passes
+    // {"body": "..."} -- silently handed the model an empty state.
+    const state: []const u8 = if (parsed_q.value.object.get("state")) |sv|
+        (if (sv == .string) sv.string else try std.json.Stringify.valueAlloc(aa, sv, .{}))
+    else
+        "";
 
     try w.print("state: {s}\n", .{state});
     try w.flush();
