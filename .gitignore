@@ -1,0 +1,37 @@
+# Zig build output
+.zig-cache/
+zig-out/
+
+# Progress tracking files
+*_progress.md
+*_findings.md
+*_task_plan.md
+.tmp/
+
+# Agent configuration
+AGENTS.md
+
+# Downloads directory (user files)
+downloads/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Brainstorming visual companion sessions
+.superpowers/
+
+
+*.exe
+*.pdb
+
+# Model checkpoint (643 MB) — download it from the Hugging Face hub instead:
+#   huggingface-cli download convaiinnovations/laya-multilingual --local-dir .
+model.safetensors
