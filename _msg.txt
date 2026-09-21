@@ -1,0 +1,13 @@
+Bilingual README, English by default, with an honest status header
+
+README.md is now English -- that is the one GitHub shows -- and README.zh-CN.md
+holds the Chinese version, each linking to the other at the top.
+
+Both open with where the project actually stands: about two hours from "can this
+model run outside Python" to a working port, half finished, not deeply optimized,
+never used in anything real, expect rough edges and missing features. Said plainly
+rather than buried, so nobody clones it expecting a finished runtime.
+
+The verification section stays prominent for the opposite reason: the one thing
+this project does have is a forward pass that is measured against an independent
+reference, and a reader needs that to tell a model quirk from a porting bug.
