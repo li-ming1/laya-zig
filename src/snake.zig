@@ -183,14 +183,14 @@ pub const Snake = struct {
     }
 
     /// The text handed to the chooser (and so to the model) for this position.
+    /// Kept deliberately terse: the model is quadratic-ish in prompt length, and
+    /// ~115 tokens instead of ~295 makes a move roughly 2x faster.
     pub fn stateText(self: *const Snake, alloc: Allocator) ![]u8 {
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
         const w = &aw.writer;
         const h = self.head();
-        try w.print("Snake game on a {d} x {d} board. Row 0 is the top row and column 0 is the left column.\n", .{ self.size, self.size });
-        try w.writeAll("H is your head, o is your body, * is the food and . is empty. Moving outside the board or into your own body ends the game.\n");
-        try w.writeAll("Board:\n");
+        try w.print("{d}x{d} snake board. H=head o=body *=food .=empty. Board edge and body kill.\n", .{ self.size, self.size });
         for (0..self.size) |r| {
             try w.print("{d} ", .{r});
             for (0..self.size) |c| {
@@ -198,15 +198,12 @@ pub const Snake = struct {
             }
             try w.writeByte('\n');
         }
-        try w.print("Your head is at row {d} column {d}.\n", .{ h[0], h[1] });
-        try w.print("The food is at row {d} column {d}.\n", .{ self.food[0], self.food[1] });
-        try w.print("Your length is {d}.\n", .{self.body.items.len});
-        try w.writeAll("The four cells around the head:\n");
+        try w.print("head {d},{d}  food {d},{d}  length {d}\n", .{ h[0], h[1], self.food[0], self.food[1], self.body.items.len });
         for (DIRS) |d| {
             if (self.neighbour(h, d)) |nb| {
-                try w.print("  moving {s} enters row {d} column {d}, which is {s}.\n", .{ d.label(), nb[0], nb[1], self.cellDesc(nb[0], nb[1]) });
+                try w.print("{s} {d},{d} {s}\n", .{ d.label(), nb[0], nb[1], self.cellDesc(nb[0], nb[1]) });
             } else {
-                try w.print("  moving {s} leaves the board.\n", .{d.label()});
+                try w.print("{s} edge\n", .{d.label()});
             }
         }
         return try alloc.dupe(u8, w.buffered());
@@ -217,9 +214,9 @@ pub const Snake = struct {
         const h = self.head();
         for (DIRS, 0..) |d, i| {
             if (self.neighbour(h, d)) |nb| {
-                opts[i] = try std.fmt.allocPrint(alloc, "move {s} into row {d} column {d}, which is {s}", .{ d.label(), nb[0], nb[1], self.cellDesc(nb[0], nb[1]) });
+                opts[i] = try std.fmt.allocPrint(alloc, "{s} to {d},{d} ({s})", .{ d.label(), nb[0], nb[1], self.cellDesc(nb[0], nb[1]) });
             } else {
-                opts[i] = try std.fmt.allocPrint(alloc, "move {s} out of the board, which ends the game", .{d.label()});
+                opts[i] = try std.fmt.allocPrint(alloc, "{s} off the board (dies)", .{d.label()});
             }
         }
     }

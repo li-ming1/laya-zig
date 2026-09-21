@@ -13,7 +13,11 @@
 //! q.json: {"state": "...", "questions": {"id": {"type": "choice"|"score"|"noul",
 //!         "instructions": "...", "criteria": {...}|[...]}}}
 //!
-//! browser: --serve [--port 8080]  start the local UI (see src/web/index.html)
+//! browser: --serve [--port 8080]  start the local UI (see src/web/index.html,
+//!                                 smoke-tested by tools/web-smoke.js)
+//! misc:   --selftest               check the SIMD kernels against f64 (run after
+//!                                 touching dotv/matmul — they have been miscompiled
+//!                                 by this zig build before)
 //!
 //! snake:  --snake                let the model play Snake (one game, animated board)
 //!         --snake --games 10     summary over N games, no animation
@@ -149,19 +153,80 @@ const MM = struct {
 /// NOTE: kept as a single 8-wide accumulator on purpose. A 4-accumulator / 32-wide
 /// unrolled version is miscompiled by this zig build (0.17.0-dev.1737) and silently
 /// returns wrong results, so do not "optimise" it back without re-validating.
-/// dot product of two equal-length slices
+/// dot product of two equal-length slices.
+///
+/// NOTE: an earlier 4-accumulator / 32-wide-unrolled variant of this function was
+/// silently miscompiled by zig 0.17.0-dev.1737 (results ~40% off). Any change here
+/// must be re-validated with `laya.exe --selftest`, which checks this kernel against
+/// an f64 reference for every shape the model uses.
 fn dotv(a: []const f32, b: []const f32) f32 {
     const n = @min(a.len, b.len);
-    var acc: @Vector(8, f32) = @splat(0.0);
+    var a0: @Vector(8, f32) = @splat(0.0);
+    var a1: @Vector(8, f32) = @splat(0.0);
     var i: usize = 0;
+    while (i + 16 <= n) : (i += 16) {
+        const x0: @Vector(8, f32) = @bitCast(a[i..][0..8].*);
+        const x1: @Vector(8, f32) = @bitCast(a[i + 8 ..][0..8].*);
+        const y0: @Vector(8, f32) = @bitCast(b[i..][0..8].*);
+        const y1: @Vector(8, f32) = @bitCast(b[i + 8 ..][0..8].*);
+        a0 += x0 * y0;
+        a1 += x1 * y1;
+    }
     while (i + 8 <= n) : (i += 8) {
-        const av: @Vector(8, f32) = @bitCast(a[i..][0..8].*);
-        const bv: @Vector(8, f32) = @bitCast(b[i..][0..8].*);
-        acc += av * bv;
+        const x0: @Vector(8, f32) = @bitCast(a[i..][0..8].*);
+        const y0: @Vector(8, f32) = @bitCast(b[i..][0..8].*);
+        a0 += x0 * y0;
     }
     var s: f32 = 0;
     while (i < n) : (i += 1) s += a[i] * b[i];
-    return s + @reduce(.Add, acc);
+    return s + @reduce(.Add, a0 + a1);
+}
+
+/// `--selftest`: check the SIMD kernels against f64 for the shapes the model uses.
+fn selfTest(gpa: Allocator, w: *std.Io.Writer) !void {
+    const Shape = struct { rows: usize, n: usize, k: usize, what: []const u8 };
+    const shapes = [_]Shape{
+        .{ .rows = 1, .n = 768, .k = 768, .what = "scorer / act head" },
+        .{ .rows = 63, .n = 2304, .k = 768, .what = "qkv + mlp in" },
+        .{ .rows = 63, .n = 768, .k = 1152, .what = "mlp out" },
+        .{ .rows = 63, .n = 3072, .k = 768, .what = "head ff" },
+        .{ .rows = 63, .n = 768, .k = 768, .what = "attn / head proj" },
+    };
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    var worst: f64 = 0;
+    for (shapes) |s| {
+        const x = try gpa.alloc(f32, s.rows * s.k);
+        defer gpa.free(x);
+        const wm = try gpa.alloc(f32, s.n * s.k);
+        defer gpa.free(wm);
+        const out = try gpa.alloc(f32, s.rows * s.n);
+        defer gpa.free(out);
+        for (x) |*v| v.* = rng.random().float(f32) * 2.0 - 1.0;
+        for (wm) |*v| v.* = rng.random().float(f32) * 2.0 - 1.0;
+
+        matmul(gpa, out, x, wm, s.rows, s.n, s.k);
+
+        var local_worst: f64 = 0;
+        for (0..s.rows) |i| {
+            var j: usize = 0;
+            while (j < s.n) : (j += 29) {
+                var ref: f64 = 0;
+                for (0..s.k) |t| ref += @as(f64, x[i * s.k + t]) * @as(f64, wm[j * s.k + t]);
+                const got: f64 = out[i * s.n + j];
+                const rel = @abs(got - ref) / @max(1.0, @abs(ref));
+                if (rel > local_worst) local_worst = rel;
+            }
+        }
+        worst = @max(worst, local_worst);
+        try w.print("  {d:>3}x{d:<5} x {d:>4}x{d:<5} {s:<18} max rel err {e:.2}\n", .{ s.rows, s.k, s.k, s.n, s.what, local_worst });
+    }
+    try w.print("\nworst relative error vs f64: {e:.3}\n", .{worst});
+    if (worst > 1e-4) {
+        try w.print("FAIL: the GEMM kernel is wrong (expected < 1e-4)\n", .{});
+    } else {
+        try w.print("PASS\n", .{});
+    }
+    try w.flush();
 }
 
 /// single input row against n weight rows
@@ -1433,7 +1498,7 @@ const snake = @import("snake.zig");
 
 const Policy = enum { model, greedy, random };
 
-const SNAKE_INS = "Which direction should the snake move next so that it eats the food and stays alive?";
+const SNAKE_INS = "Which move keeps the snake alive and reaches the food?";
 
 /// Model plus scratch buffers, kept alive across moves so a game never reloads 614 MB.
 const ModelChooser = struct {
@@ -1777,6 +1842,7 @@ pub fn main(init: std.process.Init) !void {
     var tokcheck: ?[]const u8 = null;
     var play = false;
     var serve = false;
+    var selftest = false;
     var port: u16 = 8080;
     var s_policy: Policy = .model;
     var s_opts = snake.Config{};
@@ -1797,6 +1863,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, a, "--debug")) {
             g_debug = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--selftest")) {
+            selftest = true;
             continue;
         }
         const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or
@@ -1839,6 +1909,12 @@ pub fn main(init: std.process.Init) !void {
     const w = &fw.interface;
 
     const t0 = nowMs(io);
+
+    if (selftest) {
+        try w.print("laya selftest (SIMD kernels vs f64)\n", .{});
+        try selfTest(gpa, w);
+        return;
+    }
 
     // ---- config
     var cfg = Cfg{};
