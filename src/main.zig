@@ -13,6 +13,12 @@
 //! q.json: {"state": "...", "questions": {"id": {"type": "choice"|"score"|"noul",
 //!         "instructions": "...", "criteria": {...}|[...]}}}
 //!
+//! snake:  --snake                let the model play Snake (one game, animated board)
+//!         --snake --games 10     summary over N games, no animation
+//!         --snake --policy greedy|random   baselines to compare against
+//!         --snake --prompt       print the board text the model is given
+//!         --size N --max-steps N --delay MS --seed N
+//!
 //! Validated against a NumPy re-implementation: identical layer-by-layer activations,
 //! logits and probabilities.
 
@@ -1415,6 +1421,111 @@ fn confidenceFromProbs(p: []const f32, k: usize) f32 {
     return @min(1.0, @max(0.0, 1.0 - ent / @log(@as(f32, @floatFromInt(k)))));
 }
 
+// --------------------------------------------------------------------------- snake glue
+//
+// Wires the model into src/snake.zig: the game asks for a direction, we hand it the
+// board text as the `state` of a 4-way `choice` question and take the argmax.
+// `--policy greedy|random` uses the baselines built into snake.zig instead.
+
+const snake = @import("snake.zig");
+
+const Policy = enum { model, greedy, random };
+
+const SNAKE_INS = "Which direction should the snake move next so that it eats the food and stays alive?";
+
+/// Model plus scratch buffers, kept alive across moves so a game never reloads 614 MB.
+const ModelChooser = struct {
+    gpa: Allocator,
+    m: *const Model,
+    tok: *const Tokenizer,
+    cfg: *const Cfg,
+    s: Scratch,
+    logits: []f32,
+    pooled: []f32,
+    ms: i64 = 0,
+
+    fn init(gpa: Allocator, m: *const Model, tok: *const Tokenizer, cfg: *const Cfg) !ModelChooser {
+        const L = cfg.max_len;
+        return .{
+            .gpa = gpa,
+            .m = m,
+            .tok = tok,
+            .cfg = cfg,
+            .s = .{
+                .x = try gpa.alloc(f32, L * D),
+                .xn = try gpa.alloc(f32, L * D),
+                .q = try gpa.alloc(f32, L * D),
+                .k = try gpa.alloc(f32, L * D),
+                .v = try gpa.alloc(f32, L * D),
+                .qkv = try gpa.alloc(f32, L * 3 * D),
+                .ctx = try gpa.alloc(f32, L * D),
+                .mlp = try gpa.alloc(f32, L * 2 * INTER),
+                .mlp2 = try gpa.alloc(f32, L * INTER),
+                .att = try gpa.alloc(f32, L * @max(L, 2 * WINDOW + 1)),
+                .ff = try gpa.alloc(f32, L * HEAD_FF),
+                .feat = try gpa.alloc(f32, 8),
+                .act_in = try gpa.alloc(f32, D + 4),
+            },
+            .logits = try gpa.alloc(f32, 8),
+            .pooled = try gpa.alloc(f32, D),
+        };
+    }
+
+    fn moveFn(ctx: *anyopaque, io: std.Io, g: *snake.Snake, status: *std.Io.Writer) anyerror!snake.Dir {
+        const self: *ModelChooser = @ptrCast(@alignCast(ctx));
+
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const text = try g.stateText(a);
+        var opts: [4][]const u8 = undefined;
+        try g.optionTexts(a, &opts);
+
+        const sq = try buildSequence(a, self.tok, text, "choice", SNAKE_INS, &opts, self.cfg.max_len, self.cfg.head_max_len);
+        const t0 = nowMs(io);
+        var f = FwdCtx{
+            .m = self.m,
+            .s = &self.s,
+            .ids = sq.ids,
+            .L = sq.ids.len,
+            .qtype = 0,
+            .markers = sq.markers,
+            .logits = self.logits,
+            .act = .{ 0, 0 },
+            .pooled = self.pooled,
+            .feat = self.s.feat,
+            .act_in = self.s.act_in,
+        };
+        forward(self.gpa, &f);
+        self.ms = nowMs(io) - t0;
+
+        const k = @min(sq.markers.len, 4);
+        const temp = @max(1e-3, self.m.temperature[0]);
+        var p: [4]f32 = .{ 0, 0, 0, 0 };
+        var mx: f32 = -std.math.inf(f32);
+        for (0..k) |r| {
+            p[r] = self.logits[r] / temp;
+            mx = @max(mx, p[r]);
+        }
+        var sum: f32 = 0;
+        for (0..k) |r| {
+            p[r] = @exp(p[r] - mx);
+            sum += p[r];
+        }
+        for (0..k) |r| p[r] /= sum;
+
+        var best: usize = 0;
+        for (0..k) |r| {
+            if (p[r] > p[best]) best = r;
+        }
+        try status.print("model: chose {s}  (up {d:.3} / down {d:.3} / left {d:.3} / right {d:.3})  conf {d:.3}  act {d:.3}  {d} tok  {d} ms\n", .{
+            snake.DIRS[best].label(), p[0], p[1], p[2], p[3], confidenceFromProbs(p[0..k], k), f.act[0], sq.ids.len, self.ms,
+        });
+        return snake.DIRS[best];
+    }
+};
+
 // --------------------------------------------------------------------------- io
 fn nowMs(io: std.Io) i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
@@ -1440,6 +1551,22 @@ const DEMO_JSON =
 const builtin = @import("builtin");
 
 extern "kernel32" fn SetConsoleOutputCP(wCodePageID: u32) callconv(.winapi) i32;
+extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetConsoleMode(h: ?*anyopaque, mode: *u32) callconv(.winapi) i32;
+extern "kernel32" fn SetConsoleMode(h: ?*anyopaque, mode: u32) callconv(.winapi) i32;
+
+/// Turn on ANSI escape handling so the snake board can repaint in place.
+/// Returns false when the console cannot do it (redirected output, old conhost),
+/// in which case frames are simply appended instead.
+fn enableAnsi() bool {
+    if (builtin.os.tag != .windows) return true;
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5; // (DWORD)-11
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const h = GetStdHandle(STD_OUTPUT_HANDLE) orelse return false;
+    var mode: u32 = 0;
+    if (GetConsoleMode(h, &mode) == 0) return false;
+    return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+}
 
 fn tokCheck(gpa: Allocator, io: std.Io, tok: *const Tokenizer, path: []const u8) !void {
     const data = try readFile(gpa, io, path);
@@ -1490,18 +1617,49 @@ pub fn main(init: std.process.Init) !void {
     var dir: []const u8 = ".";
     var json_path: ?[]const u8 = null;
     var tokcheck: ?[]const u8 = null;
+    var play = false;
+    var s_policy: Policy = .model;
+    var s_opts = snake.Config{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if ((std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--tokcheck")) and i + 1 < args.len) {
-            const key = a;
-            i += 1;
-            if (std.mem.eql(u8, key, "--dir")) dir = args[i];
-            if (std.mem.eql(u8, key, "--json")) json_path = args[i];
-            if (std.mem.eql(u8, key, "--tokcheck")) tokcheck = args[i];
-            if (std.mem.eql(u8, key, "--threads")) g_threads = std.fmt.parseInt(usize, args[i], 10) catch 4;
-        } else if (std.mem.eql(u8, a, "--debug")) {
+        if (std.mem.eql(u8, a, "--snake")) {
+            play = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--prompt")) {
+            s_opts.show_prompt = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--debug")) {
             g_debug = true;
+            continue;
+        }
+        const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or
+            std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--tokcheck") or
+            std.mem.eql(u8, a, "--size") or std.mem.eql(u8, a, "--games") or
+            std.mem.eql(u8, a, "--policy") or std.mem.eql(u8, a, "--delay") or
+            std.mem.eql(u8, a, "--seed") or std.mem.eql(u8, a, "--max-steps");
+        if (!takes_value or i + 1 >= args.len) continue;
+        const key = a;
+        i += 1;
+        const v = args[i];
+        if (std.mem.eql(u8, key, "--dir")) dir = v;
+        if (std.mem.eql(u8, key, "--json")) json_path = v;
+        if (std.mem.eql(u8, key, "--tokcheck")) tokcheck = v;
+        if (std.mem.eql(u8, key, "--threads")) g_threads = std.fmt.parseInt(usize, v, 10) catch 4;
+        if (std.mem.eql(u8, key, "--size")) s_opts.size = @max(6, @min(std.fmt.parseInt(usize, v, 10) catch 10, 24));
+        if (std.mem.eql(u8, key, "--games")) s_opts.games = @max(1, std.fmt.parseInt(usize, v, 10) catch 1);
+        if (std.mem.eql(u8, key, "--delay")) s_opts.delay_ms = std.fmt.parseInt(i64, v, 10) catch 0;
+        if (std.mem.eql(u8, key, "--seed")) s_opts.seed = std.fmt.parseInt(u64, v, 10) catch 12345;
+        if (std.mem.eql(u8, key, "--max-steps")) s_opts.max_steps = @max(1, std.fmt.parseInt(usize, v, 10) catch 400);
+        if (std.mem.eql(u8, key, "--policy")) {
+            s_policy = if (std.mem.eql(u8, v, "greedy"))
+                .greedy
+            else if (std.mem.eql(u8, v, "random"))
+                .random
+            else
+                .model;
         }
     }
     g_threads = @max(1, @min(g_threads, 64));
@@ -1562,6 +1720,22 @@ pub fn main(init: std.process.Init) !void {
     const t2 = nowMs(io);
     try w.print("weights: {d} MB, {d} threads ({d} ms)\n", .{ mr[1].len / (1024 * 1024), g_threads, t2 - t1 });
     try w.flush();
+
+    if (play) {
+        var mc = try ModelChooser.init(gpa, &m, &tok, &cfg);
+        const chooser: snake.Chooser = switch (s_policy) {
+            .model => .{ .ctx = &mc, .moveFn = ModelChooser.moveFn },
+            .greedy => snake.greedyChooser(),
+            .random => snake.randomChooser(),
+        };
+        const name = switch (s_policy) {
+            .model => "model",
+            .greedy => "greedy (baseline)",
+            .random => "random (baseline)",
+        };
+        try snake.run(gpa, io, w, chooser, name, s_opts, s_policy == .model and enableAnsi());
+        return;
+    }
 
     // ---- questions
     var arena = std.heap.ArenaAllocator.init(gpa);
