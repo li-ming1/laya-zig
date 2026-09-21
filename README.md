@@ -261,8 +261,9 @@ confidence, cycle length and repeat count, and the three-way comparison table.
 ## Files
 
 ```
-src/main.zig          tokenizer + model + forward pass + CLI + web server
+src/main.zig          tokenizer + model + forward pass + CLI
 src/snake.zig         Snake environment and baseline policies
+src/server.zig        a minimal blocking HTTP/1.1 server for --serve
 src/web/index.html    local UI (one file, embedded into the binary at build time)
 tools/refcheck.py     pure-Python reference implementation (whole-network diff)
 tools/web-smoke.js    UI script smoke test

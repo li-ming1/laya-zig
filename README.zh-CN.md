@@ -226,8 +226,9 @@ node tools/web-smoke.js
 ## 目录
 
 ```
-src/main.zig          分词器 + 模型 + 前向 + CLI + 网页服务
+src/main.zig          分词器 + 模型 + 前向 + CLI
 src/snake.zig         贪吃蛇环境与基线策略
+src/server.zig        --serve 用的极简阻塞式 HTTP/1.1 服务
 src/web/index.html    本地界面（单文件，构建时编译进二进制）
 tools/refcheck.py     纯 Python 参考实现（整网逐层对照）
 tools/web-smoke.js    页面脚本冒烟测试
