@@ -33,6 +33,10 @@ _srv.*
 *.exe
 *.pdb
 
+# Tooling scratch
+__pycache__/
+*.pyc
+
 # Model checkpoint (643 MB) — download it from the Hugging Face hub instead:
 #   huggingface-cli download convaiinnovations/laya-multilingual --local-dir .
 model.safetensors
