@@ -127,6 +127,16 @@
 
   details{margin-top:2px}
   summary{cursor:pointer;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.9px;font-weight:700}
+  details.about{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+                padding:11px 14px;box-shadow:var(--shadow);margin:0}
+  details.about summary{color:var(--fg);font-size:12px}
+  details.about p{margin:9px 0 0;color:var(--dim);max-width:100ch;font-size:12.5px}
+  details.about p.muted{color:var(--dim2)}
+  details.about code{background:var(--panel2);padding:1px 5px;border-radius:4px;
+                     font:11.5px ui-monospace,Consolas,monospace}
+  details.about b{color:var(--fg)}
+  .obs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+  @media (min-width:700px){.obs{grid-template-columns:repeat(3,minmax(0,1fr))}}
   pre{background:#080c11;border:1px solid var(--line);border-radius:10px;padding:11px 13px;
       overflow:auto;max-height:260px;font:11.5px/1.5 ui-monospace,Consolas,monospace;
       color:#aebbc9;white-space:pre-wrap;word-break:break-word;margin:8px 0 0}
@@ -136,11 +146,24 @@
 <div class="app">
 
   <header>
-    <h1>Laya 决策模型 · <b>贪吃蛇</b></h1>
+    <h1>Laya 决策模型 · <b>零样本行为观察</b></h1>
+    <span class="chip">贪吃蛇当探针</span>
     <span class="chip" id="c-policy">—</span>
     <span class="spacer"></span>
     <span class="chip" id="c-status">准备中</span>
   </header>
+
+  <details class="about" open>
+    <summary>这个实验在做什么</summary>
+    <p>每一步都是对 Laya 模型（322M，mmBERT-base 22 层 + 决策头）的一次<b>零样本前向</b>：
+    把盘面写成文本当作 state，四个方向作为四个候选项，各在自己那个 <code>&lt;mask&gt;</code>
+    位置上打分再 softmax。模型<b>没有在蛇上训练过</b>，所以这里没有任何"它会玩"的保证。</p>
+    <p>模型卡自报：零样本 typed-decisions <b>0.342</b>，随机是 <b>0.318</b>。
+    下面的循环、直接撞死、以及高置信度地选错，都是<b>预期行为而不是运行时故障</b> ——
+    前向已被一份独立的纯 Python 参考实现校验到 1e-5。</p>
+    <p class="muted">把「决策者」切到贪心/随机可以看基线对比；点「跑对照」让三个策略跑同一批种子，
+    得到这局有没有意义的答案。</p>
+  </details>
 
   <div class="bar">
     <label>决策者
@@ -159,8 +182,8 @@
     <button id="b-step">单步</button>
     <button id="b-reset">重开</button>
     <div class="sep"></div>
-    <label>对比 <input type="number" id="bn" value="5" min="1" max="50"> 局</label>
-    <button id="b-bench">跑对比</button>
+    <label>每种 <input type="number" id="bn" value="5" min="1" max="50"> 局</label>
+    <button id="b-bench">跑三项对照</button>
   </div>
 
   <div class="row main">
@@ -190,8 +213,8 @@
     </div>
 
     <div class="card">
-      <h2>统计</h2>
-      <div id="st"><div class="empty">—</div></div>
+      <h2>行为观察</h2>
+      <div id="st"><div class="empty">按「开始」积累观察数据</div></div>
     </div>
   </div>
 
@@ -214,6 +237,22 @@ const S = {
   speed: 0, history: [], stat: null, bench: null, paint: 0,
   seen: null, cycle: null, repeats: 0,
 };
+
+/* Accumulated over every game in the session -- this is the actual output of the
+   experiment, so it survives board resets and only clears on「重开」/换决策者. */
+const OBS = { moves: 0, fatalPicks: 0, confidentWrong: 0, confSum: 0, msSum: 0 };
+
+function noteObservation(g) {
+  const L = g.last;
+  if (!L) return;
+  OBS.moves++;
+  OBS.confSum += L.conf;
+  OBS.msSum += L.ms;
+  if (g.fatal && g.fatal[DIRS.indexOf(L.dir)]) {
+    OBS.fatalPicks++;
+    if (L.conf > 0.5) OBS.confidentWrong++;
+  }
+}
 
 /* The model has no memory between moves, so a board it has already seen is a
    board it will answer identically -- which shows up as the snake pacing a loop
@@ -245,6 +284,18 @@ async function api(path) {
 const policy = () => $("policy").value;
 
 function blankStat() { return { games: 0, score: 0, best: 0, wall: 0, self: 0, moves: 0, conf: 0, ms: 0 }; }
+
+/// Wipe everything the session has observed so far. Called whenever the policy
+/// or the board changes -- those numbers only mean something within one setup.
+function clearObs() {
+  S.stat = null;
+  S.bench = null;
+  OBS.moves = 0;
+  OBS.fatalPicks = 0;
+  OBS.confidentWrong = 0;
+  OBS.confSum = 0;
+  OBS.msSum = 0;
+}
 
 /* ------------------------------------------------------------------ control */
 
@@ -285,6 +336,7 @@ async function step() {
     if (g.last) S.history.push(Object.assign({}, g.last, { fatal: g.fatal.slice() }));
     if (S.history.length > 500) S.history.shift();
     noteCycle(g);
+    noteObservation(g);
     tally(g);
   } catch (e) {
     setStatus("请求失败", "dead");
@@ -518,16 +570,34 @@ function drawStats() {
   const box = $("st");
   if (S.bench) { drawBench(); return; }
   const s = S.stat;
-  if (!s || s.moves === 0) { box.innerHTML = '<div class="empty">—</div>'; return; }
+  if (OBS.moves === 0) {
+    box.innerHTML = '<div class="empty">按「开始」积累观察数据</div>';
+    return;
+  }
+  const cell = (k, v, cls) =>
+    `<div class="m"><div class="k">${k}</div><div class="v ${cls || ""}">${v}</div></div>`;
+  const pct = (a, b) => b ? (100 * a / b).toFixed(0) + "%" : "—";
 
-  let html = `<table>
-    <tr><th>决策者</th><th>局</th><th>总分</th><th>最好</th><th>撞墙</th><th>咬己</th><th>均值信度</th></tr>
-    <tr>
-      <td>${policy() === "model" ? "model" : policy()}</td>
+  let html = '<div class="obs">';
+  html += cell("累计步数", OBS.moves);
+  html += cell("选了会立刻死掉的方向",
+    OBS.fatalPicks + " (" + pct(OBS.fatalPicks, OBS.moves) + ")",
+    OBS.fatalPicks ? "bad" : "good");
+  html += cell("其中置信度还 > 0.5", OBS.confidentWrong,
+    OBS.confidentWrong ? "bad" : "good");
+  html += cell("平均置信度", (OBS.confSum / OBS.moves).toFixed(3));
+  html += cell("平均每次前向", Math.round(OBS.msSum / OBS.moves) + " ms");
+  html += cell("循环", S.cycle ? S.cycle.len + " 步 × " + S.repeats : "未出现",
+    S.cycle ? "warn" : "good");
+  html += "</div>";
+
+  if (s && s.games) {
+    html += `<table style="margin-top:11px">
+      <tr><th>决策者</th><th>局</th><th>总分</th><th>最好</th><th>撞墙</th><th>咬己</th></tr>
+      <tr><td>${policy() === "model" ? "model" : policy()}</td>
       <td class="num">${s.games}</td><td class="num">${s.score}</td><td class="num">${s.best}</td>
-      <td class="num">${s.wall}</td><td class="num">${s.self}</td>
-      <td class="num">${(s.conf / s.moves).toFixed(3)}</td>
-    </tr></table>`;
+      <td class="num">${s.wall}</td><td class="num">${s.self}</td></tr></table>`;
+  }
 
   const tail = S.history.slice(-60);
   html += '<div class="strip">' + tail.map(L => {
@@ -536,38 +606,53 @@ function drawStats() {
     const tip = "p=" + L.probs.map(x => x.toFixed(2)).join(" / ") + (died ? "  会死" : "");
     return `<span class="mv${died ? " died" : ""}" title="${tip}">${ARROW[L.dir]}</span>`;
   }).join("") + "</div>";
-  html += '<div class="legend"><span>最近 60 步方向，红色=这一步会死</span></div>';
-  if (S.cycle) {
-    html += `<div class="verdict">循环：周期 ${S.cycle.len} 步（自第 ${S.cycle.from} 步起）</div>`;
-  }
+  html += '<div class="legend"><span>最近 60 步方向，红色=会死</span>' +
+          '<span>点「跑对照」看和基线的量化差距</span></div>';
   box.innerHTML = html;
 }
 
 /* ------------------------------------------------------------------ bench */
+
+function boardSig(g) {
+  return g.snake.map(p => p[0] + "." + p[1]).join("|") + "#" + g.food.join(".");
+}
 
 async function bench() {
   const N = Math.max(1, parseInt($("bn").value, 10) || 5);
   const size = $("size").value;
   const seed0 = parseInt($("seed").value, 10) || 1;
   const list = ["model", "greedy", "random"];
-  S.bench = { running: true, done: 0, total: list.length * N, res: {} };
+  S.bench = { running: true, done: 0, total: list.length * N, res: {}, cur: "" };
   $("b-bench").disabled = true;
   $("b-play").disabled = $("b-step").disabled = true;
   stop();
   drawBench();
+
   for (const p of list) {
-    const scores = [];
+    const r = { scores: [], cycles: 0, steps: 0 };
+    S.bench.res[p] = r;
     for (let i = 0; i < N; i++) {
+      S.bench.cur = p + " 第 " + (i + 1) + " 局";
       let g = await api(`/api/new?size=${size}&seed=${seed0 + i}&policy=${p}`);
+      const seen = new Set();
       let guard = 0;
-      while (g.alive && guard++ < 3000) g = await api("/api/step?prompt=0");
-      scores.push(g.score);
-      S.bench.res[p] = scores.slice();
+      while (g.alive && guard < 400) {
+        // A policy with no memory that sees a board twice will answer twice the
+        // same way, so a repeated board means the episode provably never ends.
+        const sig = boardSig(g);
+        if (seen.has(sig)) { r.cycles++; break; }
+        seen.add(sig);
+        g = await api("/api/step?prompt=0");
+        guard++;
+      }
+      r.scores.push(g.score);
+      r.steps += guard;
       S.bench.done++;
       drawBench();
     }
   }
   S.bench.running = false;
+  S.bench.cur = "";
   $("b-bench").disabled = false;
   $("b-play").disabled = $("b-step").disabled = false;
   drawBench();
@@ -579,30 +664,49 @@ function drawBench() {
   if (!b) return;
   const pct = Math.round(100 * b.done / b.total);
   let html = `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-      <b>${b.running ? "对比进行中" : "对比完成"}</b>
+      <b>${b.running ? "对照进行中" : "对照完成"}</b>
       <span class="chip">${b.done}/${b.total}</span></div>
     <div class="prog"><i style="width:${pct}%"></i></div>`;
-  const keys = Object.keys(b.res);
-  if (keys.length) {
-    const all = [];
-    for (const k of keys) all.push.apply(all, b.res[k]);
-    const max = Math.max(1, Math.max.apply(null, all));
-    html += '<table style="margin-top:10px"><tr><th>决策者</th><th>均值</th><th>最好</th><th style="width:38%"></th></tr>';
-    for (const p of ["model", "greedy", "random"]) {
-      const sc = b.res[p];
-      if (!sc) continue;
-      const mean = sc.reduce((a, x) => a + x, 0) / sc.length;
+  if (b.running && b.cur) html += `<div class="legend"><span>${b.cur}</span></div>`;
+
+  const rows = ["model", "greedy", "random"].filter(p => b.res[p]);
+  if (rows.length) {
+    const max = Math.max(1, Math.max.apply(null, rows.map(p => b.res[p].scores).flat()));
+    html += '<table style="margin-top:10px"><tr><th>决策者</th><th>均值分</th><th>最好</th>' +
+            '<th>均步数</th><th>循环中止</th><th style="width:26%"></th></tr>';
+    for (const p of rows) {
+      const r = b.res[p];
+      const mean = r.scores.reduce((a, x) => a + x, 0) / r.scores.length;
       const w = Math.round(100 * mean / max);
       const col = p === "model" ? "#3fb950" : "#58a6ff";
       html += `<tr><td>${p}</td>
         <td class="num"><b>${mean.toFixed(2)}</b></td>
-        <td class="num">${Math.max.apply(null, sc)}</td>
+        <td class="num">${Math.max.apply(null, r.scores)}</td>
+        <td class="num">${(r.steps / r.scores.length).toFixed(0)}</td>
+        <td class="num ${r.cycles ? "bad" : ""}">${r.cycles}/${r.scores.length}</td>
         <td><div style="background:#1d2634;border-radius:3px;height:9px">
           <i style="display:block;height:100%;width:${w}%;border-radius:3px;background:${col}"></i></div></td></tr>`;
     }
     html += "</table>";
   }
-  if (b.running) html += '<div class="legend"><span>模型每步约 0.7 秒，请稍候</span></div>';
+  if (b.running) {
+    html += '<div class="legend"><span>模型每步约 0.7 秒，贪心/随机很快，请稍候</span></div>';
+  } else if (b.res.model && b.res.random) {
+    const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
+    const mm = mean(b.res.model.scores), rm = mean(b.res.random.scores);
+    const gm = b.res.greedy ? mean(b.res.greedy.scores) : null;
+    const cy = b.res.model.cycles, n = b.res.model.scores.length;
+    let txt;
+    if (mm > rm * 1.2) txt = "模型均值高于随机 —— 这个任务上它抓到了信号";
+    else if (mm < rm * 0.8) txt = "模型均值低于随机 —— 零样本下它比掷骰子还差";
+    else txt = "和随机基本没差，正是模型卡自报的 0.342 vs 0.318 的水平";
+    if (cy === n && n > 0) {
+      txt += "；而且它 " + n + " 局全部陷进死循环、从不结束 —— 比的是谁先被循环掐断";
+    }
+    html += `<div class="verdict${mm > rm * 1.2 ? " safe" : ""}">
+      model ${mm.toFixed(2)}${gm !== null ? " · greedy " + gm.toFixed(2) : ""} · random ${rm.toFixed(2)}
+      —— ${txt}</div>`;
+  }
   box.innerHTML = html;
 }
 
@@ -620,11 +724,11 @@ $("b-step").onclick = async () => {
   if (!S.game || !S.game.alive) await reset();
   if (S.game) { if (!S.stat) S.stat = blankStat(); await step(); }
 };
-$("b-reset").onclick = () => { S.stat = null; S.bench = null; reset(); };
+$("b-reset").onclick = () => { clearObs(); reset(); };
 $("b-bench").onclick = bench;
-$("policy").onchange = () => { S.stat = null; S.bench = null; reset(); };
-$("size").onchange = () => { S.stat = null; reset(); };
-$("seed").onchange = () => { S.stat = null; reset(); };
+$("policy").onchange = () => { clearObs(); reset(); };
+$("size").onchange = () => { clearObs(); reset(); };
+$("seed").onchange = () => { clearObs(); reset(); };
 $("speed").oninput = e => { S.speed = parseInt(e.target.value, 10); $("c-speed").textContent = S.speed + "ms"; };
 
 document.addEventListener("keydown", e => {

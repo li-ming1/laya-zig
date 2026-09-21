@@ -96,6 +96,10 @@ const check = (label, ok) => {
   // the stub repeats the same board every step, so a cycle must be flagged
   check('repeating board is reported as a cycle',
         $('dec').innerHTML.indexOf('陷入循环') >= 0);
+  // the stub's chosen direction is always the fatal one
+  check('observation panel counts fatal picks',
+        $('st').innerHTML.indexOf('会立刻死掉') >= 0 &&
+        $('st').innerHTML.indexOf('循环') >= 0);
 
   try { await $('b-reset').onclick(); } catch (e) { errors.push('reset: ' + e.message); }
   await new Promise(r => setTimeout(r, 40));
@@ -104,6 +108,17 @@ const check = (label, ok) => {
   try { await $('policy').onchange(); } catch (e) { errors.push('policy: ' + e.message); }
   await new Promise(r => setTimeout(r, 40));
   check('policy switch works', $('c-status').textContent === '就绪');
+  check('switching policy clears the observations', $('st').innerHTML.indexOf('积累观察数据') >= 0);
+
+  try { await $('b-bench').onclick(); } catch (e) { errors.push('bench: ' + e.message); }
+  await new Promise(r => setTimeout(r, 20));
+  check('three-way bench renders a verdict',
+        $('st').innerHTML.indexOf('random') >= 0 && $('st').innerHTML.indexOf('model') >= 0);
+  // the stub's board never changes, so games abort on the repeat instead of
+  // grinding to the 400-step guard; at least one must be counted that way
+  const bh = $('st').innerHTML;
+  check('bench aborts looping games and counts them',
+        bh.indexOf('循环中止') >= 0 && /<td class="num bad">[1-9]\d*\/\d+<\/td>/.test(bh));
 
   if (errors.length) {
     console.log('\n' + errors.length + ' failure(s)\n' + errors.join('\n'));
