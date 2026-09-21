@@ -50,7 +50,14 @@ Laya 是一个 **System-1 决策模型**：一次前向、非自回归、不生�
 
 ## 快速开始
 
-### 1. 拿模型
+### 1. 克隆
+
+```bash
+git clone https://github.com/li-ming1/laya-zig
+cd laya-zig
+```
+
+### 2. 拿模型
 
 权重不在仓库里（614 MB）。用官方渠道下到仓库根目录：
 
@@ -67,7 +74,7 @@ rl_agent_config.json       温度等配置              可选，缺省时用内
 encoder/config.json        不读取——结构常量已硬编码，换 checkpoint 才需要改
 ```
 
-### 2. 构建
+### 3. 构建
 
 需要 **Zig 0.17.0-dev.1737** 或同代开发版：代码用到了 `std.Io`、`std.process.Init`、
 `std.array_list.Managed`，稳定版编译不过。
@@ -79,7 +86,7 @@ zig build check            # 只做类型检查，不产出二进制
 zig build run              # 构建并直接跑内置 demo
 ```
 
-### 3. 跑
+### 4. 跑
 
 ```bash
 zig-out/bin/laya.exe                       # 内置 demo（印地语退款邮件，两个问题）

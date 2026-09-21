@@ -64,7 +64,14 @@ slower.
 
 ## Getting started
 
-### 1. Get the model
+### 1. Clone
+
+```bash
+git clone https://github.com/li-ming1/laya-zig
+cd laya-zig
+```
+
+### 2. Get the model
 
 The weights are not in this repository (614 MB). Download them from the official
 Hub repo into the project root:
@@ -82,7 +89,7 @@ rl_agent_config.json       temperature etc.         optional, defaults are built
 encoder/config.json        NOT read — architecture constants are hardcoded
 ```
 
-### 2. Build
+### 3. Build
 
 Requires **Zig 0.17.0-dev.1737** or an equivalent dev build: the code uses
 `std.Io`, `std.process.Init` and `std.array_list.Managed`, so a stable release
@@ -95,7 +102,7 @@ zig build check            # type-check only, no binary
 zig build run              # build and run the built-in demo
 ```
 
-### 3. Run
+### 4. Run
 
 ```bash
 zig-out/bin/laya.exe                       # built-in demo (Hindi refund email, 2 questions)
