@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laya 决策模型 · 贪吃蛇</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c232c; --line:#2b3542;
+    --fg:#e6edf3; --dim:#8b98a5; --dim2:#5b6674;
+    --green:#3fb950; --green2:#2ea043; --amber:#e3b341; --red:#f85149;
+    --blue:#58a6ff; --purple:#bc8cff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 22px 60px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+  h1{font-size:19px;margin:0;font-weight:600;letter-spacing:.2px}
+  header .sub{color:var(--dim);font-size:13px}
+  .chip{
+    font:12px/1 ui-monospace,Consolas,monospace;padding:5px 9px;border-radius:999px;
+    background:var(--panel2);border:1px solid var(--line);color:var(--dim)
+  }
+  .chip.on{color:#0d1117;background:var(--green);border-color:var(--green);font-weight:600}
+  .chip.busy{background:var(--amber);border-color:var(--amber);color:#0d1117}
+
+  .bar{
+    display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:10px 12px;margin-bottom:14px
+  }
+  .bar label{color:var(--dim);font-size:12px;display:flex;align-items:center;gap:6px}
+  select,input[type=number]{
+    background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:7px;padding:5px 8px;font:13px ui-monospace,Consolas,monospace
+  }
+  input[type=number]{width:74px}
+  input[type=range]{width:120px;accent-color:var(--green)}
+  button{
+    background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:7px;padding:6px 13px;font-size:13px;cursor:pointer
+  }
+  button:hover:not(:disabled){border-color:var(--dim2);background:#232c37}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--green2);border-color:var(--green2);color:#04150a;font-weight:600}
+  button.primary:hover:not(:disabled){background:var(--green)}
+  .sep{width:1px;height:22px;background:var(--line);margin:0 3px}
+
+  .grid{display:grid;grid-template-columns:auto minmax(320px,1fr);gap:16px;align-items:start}
+  @media (max-width:900px){.grid{grid-template-columns:1fr}}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;
+           text-transform:uppercase;letter-spacing:.7px}
+  canvas{display:block;border-radius:8px}
+
+  .opts{display:flex;flex-direction:column;gap:7px;margin-bottom:14px}
+  .opt{position:relative;background:var(--panel2);border:1px solid var(--line);
+       border-radius:7px;padding:7px 10px;overflow:hidden}
+  .opt .fill{position:absolute;inset:0;background:#213040;transform-origin:left;transition:transform .25s}
+  .opt.choose{border-color:var(--green)}
+  .opt.choose .fill{background:#17341f}
+  .opt.fatal{border-color:#5c2320}
+  .opt > *{position:relative}
+  .opt .row{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px}
+  .opt .name{font-weight:600}
+  .opt .p{font:12px ui-monospace,Consolas,monospace;color:var(--dim)}
+  .opt.choose .p{color:var(--green)}
+  .tag{font-size:11px;padding:1px 6px;border-radius:4px;border:1px solid var(--line);color:var(--dim)}
+  .tag.bad{color:var(--red);border-color:#5c2320}
+  .tag.good{color:var(--green);border-color:#1d4a2a}
+
+  .metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+  .m{background:var(--panel2);border-radius:7px;padding:7px 10px}
+  .m .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+  .m .v{font:16px/1.3 ui-monospace,Consolas,monospace}
+  .m .v.warn{color:var(--amber)} .m .v.bad{color:var(--red)}
+
+  .strip{display:flex;gap:3px;flex-wrap:wrap;margin-top:4px}
+  .mv{width:16px;height:16px;border-radius:4px;background:#232c37;color:var(--dim);
+      font:11px/16px ui-monospace,Consolas,monospace;text-align:center}
+  .mv.fatal{outline:1px solid #5c2320}
+  .mv.o{background:#17341f;color:var(--green)}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  td.num{font:13px ui-monospace,Consolas,monospace}
+
+  details{margin-top:14px}
+  summary{cursor:pointer;color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.7px}
+  pre{background:#0a0e13;border:1px solid var(--line);border-radius:8px;padding:12px;
+      overflow:auto;max-height:340px;font:12px/1.45 ui-monospace,Consolas,monospace;
+      color:#b9c4d0;white-space:pre-wrap;word-break:break-word;margin:8px 0 0}
+  .hint{color:var(--dim2);font-size:12px;margin-top:8px}
+  .prog{height:6px;background:#232c37;border-radius:3px;overflow:hidden;margin-top:8px}
+  .prog > i{display:block;height:100%;width:0;background:var(--green);transition:width .2s}
+  .empty{color:var(--dim2);font-size:13px;padding:16px 0;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Laya 决策模型 · 贪吃蛇</h1>
+    <span class="sub">每一步把棋盘写成文本，让模型做一道 4 选 1 的方向决策</span>
+    <span class="chip" id="chip-policy">policy</span>
+    <span class="chip" id="chip-status">就绪</span>
+  </header>
+
+  <div class="bar">
+    <label>决策者
+      <select id="policy">
+        <option value="model">模型 (laya)</option>
+        <option value="greedy">贪心基线</option>
+        <option value="random">随机基线</option>
+      </select>
+    </label>
+    <label>棋盘 <input type="number" id="size" value="10" min="6" max="24"></label>
+    <label>种子 <input type="number" id="seed" value="12345"></label>
+    <label>间隔 <input type="range" id="speed" min="0" max="2000" step="50" value="0">
+      <span class="chip" id="speed-v">0 ms</span></label>
+    <div class="sep"></div>
+    <button class="primary" id="btn-play">开始</button>
+    <button id="btn-step">单步</button>
+    <button id="btn-reset">重开</button>
+    <div class="sep"></div>
+    <label>对比 <input type="number" id="bench-n" value="5" min="1" max="50"> 局</label>
+    <button id="btn-bench">跑对比测试</button>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>棋盘</h2>
+      <canvas id="board" width="440" height="440"></canvas>
+      <div class="hint">空格暂停 / 继续 · S 单步 · R 重开</div>
+    </div>
+
+    <div class="card">
+      <h2>模型这一步的决策</h2>
+      <div id="decision-area"><div class="empty">还没有走过一步</div></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>概率随时间</h2>
+    <canvas id="timeline" width="1100" height="150" style="width:100%"></canvas>
+    <div class="hint">
+      四条线是模型对 up / down / left / right 的概率。曲线越平、越不动，说明它在棋盘上没有信号；
+      灰线是置信度。
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>统计</h2>
+    <div id="stats-area"><div class="empty">—</div></div>
+  </div>
+
+  <details>
+    <summary>模型实际看到的文本（state）</summary>
+    <pre id="prompt">—</pre>
+  </details>
+</div>
+
+<script>
+"use strict";
+const DIRS = ["up","down","left","right"];
+const CN = {up:"上",down:"下",left:"左",right:"右"};
+const ARROW = {up:"↑",down:"↓",left:"←",right:"→"};
+const COLOR = {up:"#58a6ff",down:"#bc8cff",left:"#e3b341",right:"#3fb950"};
+
+const el = id => document.getElementById(id);
+const S = {
+  game: null, playing: false, busy: false, timer: null,
+  speed: 0, history: [], session: null, bench: null,
+};
+
+function setStatus(t, cls) {
+  const c = el("chip-status");
+  c.textContent = t;
+  c.className = "chip" + (cls ? " " + cls : "");
+}
+
+async function api(path) {
+  const r = await fetch(path, {method: "POST"});
+  if (!r.ok) throw new Error(await r.text());
+  return await r.json();
+}
+
+function currentPolicy() { return el("policy").value; }
+
+// --------------------------------------------------------------- game control
+async function resetGame() {
+  S.playing = false; stopTimer();
+  el("btn-play").textContent = "开始";
+  setStatus("加载中…", "busy");
+  const q = `?size=${el("size").value}&seed=${el("seed").value}&policy=${currentPolicy()}`;
+  const g = await api("/api/new" + q);
+  S.game = g; S.history = [];
+  el("chip-policy").textContent = currentPolicy();
+  setStatus(g.alive ? "就绪" : "结束", null);
+  render();
+}
+
+async function stepOnce() {
+  if (S.busy || !S.game || !S.game.alive) return false;
+  S.busy = true;
+  const slow = currentPolicy() === "model";
+  if (slow) setStatus("模型推理中…", "busy");
+  let ok = true;
+  try {
+    const g = await api("/api/step?prompt=1");
+    S.game = g;
+    if (g.last) S.history.push({...g.last, fatal: g.fatal.slice()});
+    if (S.history.length > 400) S.history.shift();
+    recordSession(g);
+  } catch (e) {
+    ok = false; setStatus("请求失败", null);
+  }
+  S.busy = false;
+  setStatus(g.alive ? "就绪" : (g.death === "wall" ? "撞墙" : "咬到自己"), g.alive ? null : "on");
+  render();
+  return ok && S.game.alive;
+}
+
+function recordSession(g) {
+  if (!S.session) S.session = {games:0, score:0, best:0, wall:0, self:0, moves:0, conf:0, ms:0};
+  if (!g.alive) {
+    const s = S.session;
+    s.games++; s.score += g.score; s.best = Math.max(s.best, g.score);
+    if (g.death === "wall") s.wall++; else if (g.death === "self") s.self++;
+  }
+  if (g.last) {
+    S.session.moves++;
+    S.session.conf += g.last.conf;
+    S.session.ms += g.last.ms;
+  }
+}
+
+function startPlay() {
+  S.playing = true;
+  el("btn-play").textContent = "暂停";
+  tick();
+}
+function stopPlay() {
+  S.playing = false; stopTimer();
+  el("btn-play").textContent = "开始";
+}
+function stopTimer() { if (S.timer) { clearTimeout(S.timer); S.timer = null; } }
+
+async function tick() {
+  if (!S.playing) return;
+  const alive = await stepOnce();
+  if (!S.playing) return;
+  if (!alive) {                      // auto-restart while looping
+    await new Promise(r => setTimeout(r, 600));
+    if (!S.playing) return;
+    const seed = (parseInt(el("seed").value) || 1) + S.session.games;
+    el("seed").value = seed;
+    await resetGame();
+    S.playing = true; el("btn-play").textContent = "暂停";
+  }
+  S.timer = setTimeout(tick, S.speed);
+}
+
+// --------------------------------------------------------------- rendering
+function render() {
+  drawBoard();
+  drawDecision();
+  drawTimeline();
+  drawStats();
+  el("prompt").textContent = (S.game && S.game.prompt) ? S.game.prompt : "—";
+}
+
+function drawBoard() {
+  const cv = el("board"), g = S.game;
+  const size = g ? g.size : parseInt(el("size").value);
+  const pad = 8, cell = Math.floor((cv.width - pad * 2) / size);
+  const off = Math.round((cv.width - cell * size) / 2);
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "#0f151c";
+  ctx.beginPath(); ctx.roundRect(off - 4, off - 4, cell * size + 8, cell * size + 8, 8); ctx.fill();
+  if (!g) return;
+
+  for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) {
+    ctx.fillStyle = "#151c24";
+    ctx.beginPath();
+    ctx.roundRect(off + c * cell + 1, off + r * cell + 1, cell - 2, cell - 2, 3);
+    ctx.fill();
+  }
+  const [fr, fc] = g.food;
+  const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 250);
+  ctx.fillStyle = "#e3b341";
+  ctx.globalAlpha = 0.65 + 0.35 * pulse;
+  ctx.beginPath();
+  ctx.arc(off + fc * cell + cell / 2, off + fr * cell + cell / 2, cell * 0.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  const n = g.snake.length;
+  for (let i = n - 1; i >= 0; i--) {
+    const [r, c] = g.snake[i];
+    const t = i / Math.max(1, n - 1);
+    if (i === 0) ctx.fillStyle = "#56d364";
+    else {
+      const v = Math.round(140 - 75 * t);
+      ctx.fillStyle = `rgb(${Math.round(v*0.35)},${v},${Math.round(v*0.55)})`;
+    }
+    const inset = i === 0 ? 1.5 : 3 + t * 2;
+    ctx.beginPath();
+    ctx.roundRect(off + c * cell + inset, off + r * cell + inset,
+                  cell - inset * 2, cell - inset * 2, i === 0 ? 5 : 4);
+    ctx.fill();
+  }
+  if (!g.alive) {
+    ctx.fillStyle = "rgba(248,81,73,.16)";
+    ctx.beginPath(); ctx.roundRect(off - 4, off - 4, cell * size + 8, cell * size + 8, 8); ctx.fill();
+  }
+}
+
+function drawDecision() {
+  const g = S.game, area = el("decision-area");
+  if (!g || !g.last) { area.innerHTML = '<div class="empty">还没有走过一步</div>'; return; }
+  const L = g.last;
+  const fatal = g.fatal || [false, false, false, false];
+  const chosen = DIRS.indexOf(L.dir);
+  let html = '<div class="opts">';
+  DIRS.forEach((d, i) => {
+    const p = L.probs[i];
+    const cls = "opt" + (i === chosen ? " choose" : "") + (fatal[i] ? " fatal" : "");
+    const tag = fatal[i] ? '<span class="tag bad">这一步会死</span>'
+                         : '<span class="tag good">安全</span>';
+    html += `<div class="${cls}">
+      <div class="fill" style="transform:scaleX(${Math.max(0.001, p).toFixed(4)})"></div>
+      <div class="row">
+        <span class="name">${ARROW[d]} ${d} / ${CN[d]}</span>
+        <span>${tag}</span>
+        <span class="p">${(p * 100).toFixed(1)}%</span>
+      </div></div>`;
+  });
+  html += '</div><div class="metrics">';
+  const mm = (k, v, cls) => `<div class="m"><div class="k">${k}</div><div class="v ${cls||''}">${v}</div></div>`;
+  html += mm("模型选了", (ARROW[L.dir] || "") + " " + L.dir, chosen >= 0 && fatal[chosen] ? "bad" : "good");
+  html += mm("置信度", L.conf.toFixed(3), L.conf < 0.15 ? "warn" : "");
+  html += mm("act 概率", L.act.toFixed(3));
+  html += mm("耗时", L.ms + " ms", L.ms > 500 ? "warn" : "");
+  html += mm("prompt token", L.tokens);
+  html += mm("本步序号", g.step);
+  html += "</div>";
+  if (chosen >= 0 && fatal[chosen]) {
+    html += '<div class="hint" style="color:#f85149">⚠ 模型选了一个会立刻结束游戏的方向。</div>';
+  }
+  area.innerHTML = html;
+}
+
+function drawTimeline() {
+  const cv = el("timeline"), ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const padL = 34, padB = 18, padT = 10;
+  const gw = W - padL - 10, gh = H - padB - padT;
+  ctx.strokeStyle = "#232c37"; ctx.lineWidth = 1;
+  ctx.font = "11px ui-monospace,Consolas,monospace"; ctx.fillStyle = "#5b6674";
+  [0, 0.25, 0.5, 0.75, 1].forEach(v => {
+    const y = padT + gh * (1 - v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - 10, y); ctx.stroke();
+    ctx.fillText(v.toFixed(2), 4, y + 4);
+  });
+  const h = S.history;
+  if (h.length < 2) { ctx.fillStyle = "#5b6674"; ctx.fillText("数据不足", padL + 8, padT + gh / 2); return; }
+  const n = h.length;
+  const xAt = i => padL + gw * (i / (n - 1));
+  const yAt = v => padT + gh * (1 - Math.min(1, Math.max(0, v)));
+  DIRS.forEach((d, k) => {
+    ctx.strokeStyle = COLOR[d]; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    h.forEach((L, i) => { const x = xAt(i), y = yAt(L.probs[k]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke();
+  });
+  ctx.strokeStyle = "#5b6674"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  h.forEach((L, i) => { const x = xAt(i), y = yAt(L.conf); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#5b6674"; ctx.fillText("最近 " + n + " 步", padL + 4, H - 4);
+}
+
+function drawStats() {
+  const s = S.session, area = el("stats-area");
+  if (S.bench) { drawBench(); return; }
+  if (!s || s.moves === 0) { area.innerHTML = '<div class="empty">跑几步之后这里会显示统计</div>'; return; }
+  const rows = `
+    <table>
+      <tr><th>累计</th><th>局数</th><th>总分</th><th>最好</th><th>撞墙</th><th>咬自己</th><th>步数</th><th>平均置信度</th><th>平均耗时</th></tr>
+      <tr><td>${currentPolicy()}</td>
+          <td class="num">${s.games}</td><td class="num">${s.score}</td><td class="num">${s.best}</td>
+          <td class="num">${s.wall}</td><td class="num">${s.self}</td><td class="num">${s.moves}</td>
+          <td class="num">${(s.conf / s.moves).toFixed(3)}</td>
+          <td class="num">${Math.round(s.ms / s.moves)} ms</td></tr>
+    </table>
+    <div class="strip" style="margin-top:10px">${
+      S.history.slice(-70).map(L => {
+        const i = DIRS.indexOf(L.dir);
+        const died = L.fatal && L.fatal[i];
+        return `<span class="mv${died ? " fatal" : ""}" title="p=${L.probs.map(x=>x.toFixed(2)).join(" / ")}">${ARROW[L.dir]}</span>`;
+      }).join("")
+    }</div>
+    <div class="hint">上面是最近 70 步的方向；红框表示这一步会立刻结束游戏。</div>`;
+  area.innerHTML = rows;
+}
+
+// --------------------------------------------------------------- bench
+async function runBench() {
+  const N = Math.max(1, parseInt(el("bench-n").value) || 5);
+  const size = el("size").value, baseSeed = parseInt(el("seed").value) || 1;
+  const policies = ["model", "greedy", "random"];
+  S.bench = { running: true, progress: 0, total: policies.length * N, results: {} };
+  el("btn-bench").disabled = true;
+  drawBench();
+  for (const p of policies) {
+    const scores = [];
+    for (let i = 0; i < N; i++) {
+      S.playing = false; stopTimer();
+      let g = await api(`/api/new?size=${size}&seed=${baseSeed + i}&policy=${p}`);
+      while (g.alive) g = await api("/api/step?prompt=0");
+      scores.push(g.score);
+      S.bench.results[p] = scores.slice();
+      S.bench.progress++;
+      drawBench();
+    }
+  }
+  S.bench.running = false;
+  el("btn-bench").disabled = false;
+  drawBench();
+  S.session = null;
+}
+
+function drawBench() {
+  const area = el("stats-area"), b = S.bench;
+  if (!b || !b.results) return;
+  const pct = Math.round(100 * b.progress / b.total);
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center">
+      <b>${b.running ? "对比测试进行中…" : "对比测试完成"}</b>
+      <span class="chip">${b.progress}/${b.total} 局${b.running ? " · 模型每步约 1.3 秒，请稍候" : ""}</span>
+    </div><div class="prog"><i style="width:${pct}%"></i></div>`;
+  if (Object.keys(b.results).length) {
+    const max = Math.max(1, ...Object.values(b.results).flat());
+    html += `<table style="margin-top:12px"><tr><th>决策者</th><th>局数</th><th>平均分</th><th>最好</th><th></th></tr>`;
+    for (const p of ["model", "greedy", "random"]) {
+      const sc = b.results[p]; if (!sc) continue;
+      const mean = sc.reduce((a, x) => a + x, 0) / sc.length;
+      const best = Math.max(...sc);
+      const w = Math.round(100 * mean / max);
+      html += `<tr><td>${p}</td><td class="num">${sc.length}</td>
+        <td class="num"><b>${mean.toFixed(2)}</b></td><td class="num">${best}</td>
+        <td style="width:45%"><div style="background:#232c37;border-radius:3px;height:10px">
+          <i style="display:block;height:100%;width:${w}%;border-radius:3px;background:${p === "model" ? "#3fb950" : "#58a6ff"}"></i>
+        </div></td></tr>`;
+    }
+    html += `</table>`;
+  }
+  area.innerHTML = html;
+}
+
+// --------------------------------------------------------------- events
+el("btn-play").onclick = async () => {
+  if (S.playing) { stopPlay(); return; }
+  if (!S.game || !S.game.alive) { await resetGame(); }
+  if (!S.session) S.session = {games:0,score:0,best:0,wall:0,self:0,moves:0,conf:0,ms:0};
+  startPlay();
+};
+el("btn-step").onclick = async () => {
+  stopPlay();
+  if (!S.game || !S.game.alive) await resetGame();
+  await stepOnce();
+};
+el("btn-reset").onclick = async () => { S.session = null; S.bench = null; await resetGame(); };
+el("btn-bench").onclick = runBench;
+el("policy").onchange = async () => { S.session = null; S.bench = null; await resetGame(); };
+el("size").onchange = async () => { S.session = null; await resetGame(); };
+el("seed").onchange = async () => { S.session = null; await resetGame(); };
+el("speed").oninput = e => { S.speed = parseInt(e.target.value); el("speed-v").textContent = S.speed + " ms"; };
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); el("btn-play").click(); }
+  if (e.key === "s" || e.key === "S") el("btn-step").click();
+  if (e.key === "r" || e.key === "R") el("btn-reset").click();
+});
+setInterval(() => { if (S.game) drawBoard(); }, 400);
+
+resetGame().catch(e => { setStatus("启动失败", null); el("prompt").textContent = String(e); });
+</script>
+</body>
+</html>

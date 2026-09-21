@@ -13,6 +13,8 @@
 //! q.json: {"state": "...", "questions": {"id": {"type": "choice"|"score"|"noul",
 //!         "instructions": "...", "criteria": {...}|[...]}}}
 //!
+//! browser: --serve [--port 8080]  start the local UI (see src/web/index.html)
+//!
 //! snake:  --snake                let the model play Snake (one game, animated board)
 //!         --snake --games 10     summary over N games, no animation
 //!         --snake --policy greedy|random   baselines to compare against
@@ -1443,6 +1445,7 @@ const ModelChooser = struct {
     logits: []f32,
     pooled: []f32,
     ms: i64 = 0,
+    last: WebSession.LastMove = .{ .dir = .up, .probs = .{ 0.25, 0.25, 0.25, 0.25 }, .conf = 0, .act = 0, .tokens = 0, .ms = 0 },
 
     fn init(gpa: Allocator, m: *const Model, tok: *const Tokenizer, cfg: *const Cfg) !ModelChooser {
         const L = cfg.max_len;
@@ -1519,12 +1522,167 @@ const ModelChooser = struct {
         for (0..k) |r| {
             if (p[r] > p[best]) best = r;
         }
+        const conf = confidenceFromProbs(p[0..k], k);
+        self.last = .{ .dir = snake.DIRS[best], .probs = p, .conf = conf, .act = f.act[0], .tokens = sq.ids.len, .ms = self.ms };
         try status.print("model: chose {s}  (up {d:.3} / down {d:.3} / left {d:.3} / right {d:.3})  conf {d:.3}  act {d:.3}  {d} tok  {d} ms\n", .{
-            snake.DIRS[best].label(), p[0], p[1], p[2], p[3], confidenceFromProbs(p[0..k], k), f.act[0], sq.ids.len, self.ms,
+            snake.DIRS[best].label(), p[0], p[1], p[2], p[3], conf, f.act[0], sq.ids.len, self.ms,
         });
         return snake.DIRS[best];
     }
 };
+
+// --------------------------------------------------------------------------- web ui
+//
+// `zig-out/bin/laya.exe --serve` starts a tiny HTTP server; the page in
+// src/web/index.html draws the board and calls /api/step once per move. The game
+// still lives here in Zig, so the browser shows exactly what the CLI shows.
+
+const server = @import("server.zig");
+const INDEX_HTML = @embedFile("web/index.html");
+
+const WebSession = struct {
+    gpa: Allocator,
+    m: *const Model,
+    tok: *const Tokenizer,
+    cfg: *const Cfg,
+    mc: *ModelChooser,
+    game: snake.Snake = undefined,
+    has_game: bool = false,
+    policy: Policy = .model,
+    base: snake.Chooser = undefined,
+    last: ?LastMove = null,
+    fatal: [4]bool = .{ false, false, false, false },
+    prompt: AList(u8),
+
+    const LastMove = struct {
+        dir: snake.Dir,
+        probs: [4]f32,
+        conf: f32,
+        act: f32,
+        tokens: usize,
+        ms: i64,
+    };
+
+    fn newGame(self: *WebSession, size: usize, seed: u64) !void {
+        if (self.has_game) self.game.deinit();
+        self.game = try snake.Snake.init(self.gpa, size, seed);
+        self.has_game = true;
+        self.last = null;
+        try self.capture(&self.game);
+    }
+
+    fn chooser(self: *WebSession) snake.Chooser {
+        return .{ .ctx = self, .moveFn = moveFn };
+    }
+
+    /// Record what the board looked like before the move (for the UI): the exact
+    /// prompt text and which directions would have ended the game.
+    fn capture(self: *WebSession, g: *snake.Snake) !void {
+        self.prompt.clearRetainingCapacity();
+        const txt = try g.stateText(self.gpa);
+        defer self.gpa.free(txt);
+        try self.prompt.appendSlice(txt);
+        const h = g.head();
+        for (snake.DIRS, 0..) |d, i| {
+            const nb = g.neighbour(h, d);
+            self.fatal[i] = nb == null or g.occupied[nb.?[0] * g.size + nb.?[1]];
+        }
+    }
+
+    fn moveFn(ctx: *anyopaque, io: std.Io, g: *snake.Snake, status: *std.Io.Writer) anyerror!snake.Dir {
+        const self: *WebSession = @ptrCast(@alignCast(ctx));
+        try self.capture(g);
+        switch (self.policy) {
+            .model => {
+                const d = try ModelChooser.moveFn(self.mc, io, g, status);
+                self.last = self.mc.last;
+                return d;
+            },
+            .greedy, .random => {
+                const d = try self.base.moveFn(self.base.ctx, io, g, status);
+                // baselines are deterministic about the direction they pick
+                var p: [4]f32 = .{ 0, 0, 0, 0 };
+                p[@intFromEnum(d)] = 1;
+                self.last = .{ .dir = d, .probs = p, .conf = 1, .act = 1, .tokens = 0, .ms = 0 };
+                return d;
+            },
+        }
+    }
+
+    fn writeState(self: *WebSession, out: *std.Io.Writer, with_prompt: bool) !void {
+        const g = &self.game;
+        try out.print("{{\"size\":{d},\"score\":{d},\"step\":{d},\"alive\":{s},\"illegal\":{d},\"death\":\"{s}\",\"dir\":\"{s}\",\"food\":[{d},{d}],\"snake\":[", .{
+            g.size,
+            g.score,
+            g.steps,
+            if (g.alive) "true" else "false",
+            g.illegal,
+            if (g.alive) "" else if (g.hit_wall) "wall" else "self",
+            g.dir.label(),
+            g.food[0],
+            g.food[1],
+        });
+        for (g.body.items, 0..) |c, i| {
+            if (i > 0) try out.writeByte(',');
+            try out.print("[{d},{d}]", .{ c[0], c[1] });
+        }
+        try out.writeAll("],\"fatal\":[");
+        for (self.fatal, 0..) |f, i| {
+            if (i > 0) try out.writeByte(',');
+            try out.writeAll(if (f) "true" else "false");
+        }
+        try out.writeAll("],\"last\":");
+        if (self.last) |l| {
+            try out.print("{{\"dir\":\"{s}\",\"probs\":[{d:.5},{d:.5},{d:.5},{d:.5}],\"conf\":{d:.5},\"act\":{d:.5},\"tokens\":{d},\"ms\":{d}}}", .{
+                l.dir.label(), l.probs[0], l.probs[1], l.probs[2], l.probs[3], l.conf, l.act, l.tokens, l.ms,
+            });
+        } else {
+            try out.writeAll("null");
+        }
+        if (with_prompt) {
+            try out.writeAll(",\"prompt\":");
+            try server.jsonString(out, self.prompt.items);
+        }
+        try out.writeAll("}");
+    }
+};
+
+fn webHandle(ctx: *anyopaque, io: std.Io, req: server.Request, out: *std.Io.Writer) anyerror!server.Response {
+    const self: *WebSession = @ptrCast(@alignCast(ctx));
+
+    if (std.mem.eql(u8, req.path, "/") or std.mem.eql(u8, req.path, "/index.html")) {
+        return .{ .content_type = "text/html; charset=utf-8", .body = INDEX_HTML };
+    }
+
+    if (std.mem.eql(u8, req.path, "/api/new")) {
+        const size: usize = @intCast(@max(6, @min(req.intParam("size", 10), 24)));
+        const seed: u64 = @intCast(@max(0, req.intParam("seed", 12345)));
+        const pol = req.param("policy") orelse "model";
+        self.policy = if (std.mem.eql(u8, pol, "greedy"))
+            .greedy
+        else if (std.mem.eql(u8, pol, "random"))
+            .random
+        else
+            .model;
+        self.base = if (self.policy == .random) snake.randomChooser() else snake.greedyChooser();
+        try self.newGame(size, seed);
+        try self.writeState(out, true);
+        return .{};
+    }
+
+    if (std.mem.eql(u8, req.path, "/api/step")) {
+        if (self.game.alive) {
+            var scratch: std.Io.Writer.Allocating = .init(self.gpa);
+            defer scratch.deinit();
+            const d = try self.chooser().moveFn(self, io, &self.game, &scratch.writer);
+            self.game.step(d);
+        }
+        try self.writeState(out, req.intParam("prompt", 1) != 0);
+        return .{};
+    }
+
+    return .{ .status = 404, .body = "{\"error\":\"no route\"}" };
+}
 
 // --------------------------------------------------------------------------- io
 fn nowMs(io: std.Io) i64 {
@@ -1618,6 +1776,8 @@ pub fn main(init: std.process.Init) !void {
     var json_path: ?[]const u8 = null;
     var tokcheck: ?[]const u8 = null;
     var play = false;
+    var serve = false;
+    var port: u16 = 8080;
     var s_policy: Policy = .model;
     var s_opts = snake.Config{};
     var i: usize = 1;
@@ -1625,6 +1785,10 @@ pub fn main(init: std.process.Init) !void {
         const a = args[i];
         if (std.mem.eql(u8, a, "--snake")) {
             play = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--serve")) {
+            serve = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--prompt")) {
@@ -1639,7 +1803,8 @@ pub fn main(init: std.process.Init) !void {
             std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--tokcheck") or
             std.mem.eql(u8, a, "--size") or std.mem.eql(u8, a, "--games") or
             std.mem.eql(u8, a, "--policy") or std.mem.eql(u8, a, "--delay") or
-            std.mem.eql(u8, a, "--seed") or std.mem.eql(u8, a, "--max-steps");
+            std.mem.eql(u8, a, "--seed") or std.mem.eql(u8, a, "--max-steps") or
+            std.mem.eql(u8, a, "--port");
         if (!takes_value or i + 1 >= args.len) continue;
         const key = a;
         i += 1;
@@ -1653,6 +1818,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, key, "--delay")) s_opts.delay_ms = std.fmt.parseInt(i64, v, 10) catch 0;
         if (std.mem.eql(u8, key, "--seed")) s_opts.seed = std.fmt.parseInt(u64, v, 10) catch 12345;
         if (std.mem.eql(u8, key, "--max-steps")) s_opts.max_steps = @max(1, std.fmt.parseInt(usize, v, 10) catch 400);
+        if (std.mem.eql(u8, key, "--port")) port = std.fmt.parseInt(u16, v, 10) catch 8080;
         if (std.mem.eql(u8, key, "--policy")) {
             s_policy = if (std.mem.eql(u8, v, "greedy"))
                 .greedy
@@ -1720,6 +1886,27 @@ pub fn main(init: std.process.Init) !void {
     const t2 = nowMs(io);
     try w.print("weights: {d} MB, {d} threads ({d} ms)\n", .{ mr[1].len / (1024 * 1024), g_threads, t2 - t1 });
     try w.flush();
+
+    if (serve) {
+        const mc = try gpa.create(ModelChooser);
+        mc.* = try ModelChooser.init(gpa, &m, &tok, &cfg);
+        var session = WebSession{
+            .gpa = gpa,
+            .m = &m,
+            .tok = &tok,
+            .cfg = &cfg,
+            .mc = mc,
+            .prompt = AList(u8).init(gpa),
+        };
+        try session.newGame(10, 12345);
+        const base = snake.greedyChooser();
+        session.base = base;
+        server.serve(gpa, io, .{ .port = port, .log = w }, .{ .ctx = &session, .handleFn = webHandle }) catch |e| {
+            try w.print("server stopped: {s}\n", .{@errorName(e)});
+            try w.flush();
+        };
+        return;
+    }
 
     if (play) {
         var mc = try ModelChooser.init(gpa, &m, &tok, &cfg);
