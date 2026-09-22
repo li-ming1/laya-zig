@@ -24,6 +24,7 @@
 //!         --snake --games 10     summary over N games, no animation
 //!         --snake --policy greedy|random   baselines to compare against
 //!         --snake --prompt       print the board text the model is given
+//!         --snake --promptv 0..7  how the position is phrased (ladder in snake.zig)
 //!         --size N --max-steps N --delay MS --seed N
 //!
 //! Validated against an independent pure-Python reference implementation
@@ -2184,6 +2185,30 @@ const ModelChooser = struct {
         }
         for (0..k) |r| p[r] /= sum;
 
+        // `--promptv 6` treats death as a constraint of the environment rather
+        // than a preference to be learned: the model then ranks only the moves
+        // that are still legal. `--promptv 7` also drops the moves that step
+        // away from the food, leaving the model to break the tie between the
+        // survivors that close the distance. Without this the reported
+        // probabilities are the model's own, fatal ones included.
+        if (snake.prompt_variant >= 6) {
+            var left: f32 = 0;
+            for (0..k) |r| {
+                const keep = if (snake.prompt_variant == 7)
+                    g.moveIsBest(snake.DIRS[r])
+                else
+                    !g.moveIsFatal(snake.DIRS[r]);
+                if (keep) {
+                    left += p[r];
+                } else {
+                    p[r] = 0;
+                }
+            }
+            if (left > 0) {
+                for (0..k) |r| p[r] /= left;
+            }
+        }
+
         var best: usize = 0;
         for (0..k) |r| {
             if (p[r] > p[best]) best = r;
@@ -2463,6 +2488,7 @@ pub fn main(init: std.process.Init) !void {
     var port: u16 = 8080;
     var s_policy: Policy = .model;
     var s_opts = snake.Config{};
+    var snake_prompt_v: u8 = 0;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -2476,6 +2502,11 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, a, "--prompt")) {
             s_opts.show_prompt = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--promptv") and i + 1 < args.len) {
+            snake_prompt_v = std.fmt.parseInt(u8, args[i + 1], 10) catch 0;
+            i += 1;
             continue;
         }
         if (std.mem.eql(u8, a, "--debug")) {
@@ -2533,6 +2564,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     g_threads = @max(1, @min(g_threads, 64));
+    snake.prompt_variant = @min(snake_prompt_v, 7);
 
     var out_buf: [1 << 16]u8 = undefined;
     var fw = std.Io.File.stdout().writer(io, &out_buf);

@@ -44,6 +44,26 @@ pub const Dir = enum(u8) {
 
 pub const DIRS = [_]Dir{ .up, .down, .left, .right };
 
+/// Which way the position is described to the chooser. Only ever changes the
+/// text -- the environment, the seeds and the legality checks are untouched, so
+/// scores across variants are comparable.
+///
+/// var  state   option wording
+/// 0    grid    terse, with cell coordinates            (what shipped first)
+/// 1    grid    one sentence naming what the move does
+/// 2    grid    verdict first: "fatal" / "safe, N steps from the food"
+/// 3    prose   verdict first
+/// 4    prose   one sentence naming what the move does
+/// 5    prose   bare geometry in the state; the option carries only a word --
+///              "would kill the snake" / "eats the food" / "one step closer"
+/// 6    as 5, but directions that die are masked out before the argmax, so the
+///      model only ever ranks the moves the environment still allows
+/// 7    as 5, but the argmax is restricted to the moves that both survive and
+///      close the distance as much as any surviving move does. What is left for
+///      the model is the tie between them -- the question it is not asked to
+///      answer from geometry it cannot read
+pub var prompt_variant: u8 = 0;
+
 pub const Snake = struct {
     size: usize,
     body: std.array_list.Managed([2]usize), // [0] is the head
@@ -182,14 +202,88 @@ pub const Snake = struct {
         return "empty";
     }
 
+    /// What one move would actually do, computed from the board rather than
+    /// phrased for the model. Every prompt variant below is a different way of
+    /// saying these same facts.
+    const Move = struct {
+        cell: ?[2]usize,
+        what: []const u8,
+        fatal: bool,
+        eats: bool,
+        food_dist: usize,
+    };
+
+    fn moveOf(self: *const Snake, d: Dir) Move {
+        const h = self.head();
+        const nb = self.neighbour(h, d) orelse
+            return .{ .cell = null, .what = "off the board", .fatal = true, .eats = false, .food_dist = 0 };
+        const fd = dist(nb, self.food);
+        if (nb[0] == self.food[0] and nb[1] == self.food[1])
+            return .{ .cell = nb, .what = "the food", .fatal = false, .eats = true, .food_dist = 0 };
+        if (self.occupied[self.idx(nb[0], nb[1])])
+            return .{ .cell = nb, .what = "its own body", .fatal = true, .eats = false, .food_dist = fd };
+        return .{ .cell = nb, .what = "open ground", .fatal = false, .eats = false, .food_dist = fd };
+    }
+
+    fn proseState() bool {
+        return prompt_variant >= 3;
+    }
+
+    /// `--promptv 6` asks the model to rank only the moves the board still
+    /// allows, so the chooser needs the same fact the prompt states.
+    pub fn moveIsFatal(self: *const Snake, d: Dir) bool {
+        return self.moveOf(d).fatal;
+    }
+
+    /// `--promptv 7` narrows the choice one step further: a move counts only if
+    /// it survives *and* ends no farther from the food than any surviving move
+    /// does. The board then supplies the objective and the model is left with the
+    /// tie between equally good survivors.
+    pub fn moveIsBest(self: *const Snake, d: Dir) bool {
+        const m = self.moveOf(d);
+        if (m.fatal) return false;
+        var best = m.food_dist;
+        for (DIRS) |o| {
+            const om = self.moveOf(o);
+            if (!om.fatal and om.food_dist < best) best = om.food_dist;
+        }
+        return m.food_dist == best;
+    }
+
     /// The text handed to the chooser (and so to the model) for this position.
-    /// Kept deliberately terse: the model is quadratic-ish in prompt length, and
-    /// ~115 tokens instead of ~295 makes a move roughly 2x faster.
+    /// Kept deliberately terse for variant 0: the model is quadratic-ish in prompt
+    /// length, and ~115 tokens instead of ~295 makes a move roughly 2x faster.
     pub fn stateText(self: *const Snake, alloc: Allocator) ![]u8 {
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
         const w = &aw.writer;
         const h = self.head();
+        if (proseState()) {
+            try w.print("Snake on a {d}x{d} board. Reaching the edge of the board or touching its own body kills it, and the food is what the snake wants.\n", .{ self.size, self.size });
+            try w.print("The head is at row {d}, column {d}, moving {s}; the body is {d} long.\n", .{ h[0], h[1], self.dir.label(), self.body.items.len });
+            try w.print("The food is at row {d}, column {d}, {d} steps away.\n", .{ self.food[0], self.food[1], dist(h, self.food) });
+            for (DIRS) |d| {
+                const m = self.moveOf(d);
+                if (prompt_variant >= 5) {
+                    // Geometry only; the verdict lives in the option text, which is
+                    // the whole point of this variant.
+                    try w.print("Moving {s}: {s}.\n", .{ d.label(), m.what });
+                    continue;
+                }
+                const where = if (m.cell) |c|
+                    try std.fmt.allocPrint(alloc, "row {d}, column {d}", .{ c[0], c[1] })
+                else
+                    "off the board";
+                const outcome = if (m.fatal)
+                    "fatal"
+                else if (m.eats)
+                    "it eats the food"
+                else
+                    try std.fmt.allocPrint(alloc, "safe, {d} steps from the food", .{ m.food_dist });
+                try w.print("Moving {s} enters {s}: {s}\n", .{ d.label(), where, outcome });
+            }
+            return try alloc.dupe(u8, w.buffered());
+        }
         try w.print("{d}x{d} snake board. H=head o=body *=food .=empty. Board edge and body kill.\n", .{ self.size, self.size });
         for (0..self.size) |r| {
             try w.print("{d} ", .{r});
@@ -211,13 +305,35 @@ pub const Snake = struct {
 
     /// One description per direction, in DIRS order.
     pub fn optionTexts(self: *const Snake, alloc: Allocator, opts: *[4][]const u8) !void {
-        const h = self.head();
+        const hd = dist(self.head(), self.food);
         for (DIRS, 0..) |d, i| {
-            if (self.neighbour(h, d)) |nb| {
-                opts[i] = try std.fmt.allocPrint(alloc, "{s} to {d},{d} ({s})", .{ d.label(), nb[0], nb[1], self.cellDesc(nb[0], nb[1]) });
-            } else {
-                opts[i] = try std.fmt.allocPrint(alloc, "{s} off the board (dies)", .{d.label()});
-            }
+            const m = self.moveOf(d);
+            opts[i] = switch (prompt_variant) {
+                5, 6, 7 => if (m.fatal)
+                    try std.fmt.allocPrint(alloc, "{s} would kill the snake", .{d.label()})
+                else if (m.eats)
+                    try std.fmt.allocPrint(alloc, "{s} eats the food", .{d.label()})
+                else if (m.food_dist < hd)
+                    try std.fmt.allocPrint(alloc, "{s} moves one step closer to the food", .{d.label()})
+                else
+                    try std.fmt.allocPrint(alloc, "{s} moves one step away from the food", .{d.label()}),
+                1, 4 => if (m.fatal)
+                    try std.fmt.allocPrint(alloc, "{s} enters {s}: the snake dies", .{ d.label(), m.what })
+                else if (m.eats)
+                    try std.fmt.allocPrint(alloc, "{s} enters the food: the snake eats and lives", .{d.label()})
+                else
+                    try std.fmt.allocPrint(alloc, "{s} enters {s}, {d} steps from the food: the snake lives", .{ d.label(), m.what, m.food_dist }),
+                2, 3 => if (m.fatal)
+                    try std.fmt.allocPrint(alloc, "{s}: fatal, {s}", .{ d.label(), m.what })
+                else if (m.eats)
+                    try std.fmt.allocPrint(alloc, "{s}: eats the food", .{d.label()})
+                else
+                    try std.fmt.allocPrint(alloc, "{s}: safe, {d} steps from the food", .{ d.label(), m.food_dist }),
+                else => if (m.cell) |c|
+                    try std.fmt.allocPrint(alloc, "{s} to {d},{d} ({s})", .{ d.label(), c[0], c[1], self.cellDesc(c[0], c[1]) })
+                else
+                    try std.fmt.allocPrint(alloc, "{s} off the board (dies)", .{d.label()}),
+            };
         }
     }
 };
