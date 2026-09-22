@@ -284,8 +284,12 @@ const Pool = struct {
 
     fn start(self: *Pool, alloc: Allocator, nt: usize) void {
         self.threads = AList(std.Thread).init(alloc);
+        // A worker's largest frame is the 48 KB weight tile in `mmJob16`. The 16 MB
+        // default reserved ~176 MB of commit charge across 11 workers for stacks
+        // that never grow past that tile.
+        const opts = std.Thread.SpawnConfig{ .stack_size = 256 * 1024 };
         for (1..nt) |_| {
-            const t = std.Thread.spawn(.{}, worker, .{self}) catch break;
+            const t = std.Thread.spawn(opts, worker, .{self}) catch break;
             self.threads.append(t) catch break;
             self.nworkers += 1;
         }
@@ -315,14 +319,24 @@ fn parallel(alloc: Allocator, n: usize, ctx: *anyopaque, f: JobFn) void {
 }
 
 // --------------------------------------------------------------------------- matmul
+/// The parts of a matmul the kernel sees as f32. The weight slice lives in the job
+/// structs below, because its element type is the only difference between them.
 const MM = struct {
     out: []f32,
     x: []const f32,
-    w: []const f32,
     n: usize,
     k: usize,
     rows: usize,
 };
+
+const MM32 = struct { m: MM, w: []align(1) const f32 };
+
+/// A row-major [n][k] weight matrix as it sits in the file, so the kernel converts
+/// on load and no F32 copy of it is ever made.
+const MM16 = struct { m: MM, w: []align(1) const f16 };
+
+/// Widening four rows at a time needs room for the largest k a caller passes.
+const tile_k_max: usize = @max(@max(D, INTER), HEAD_FF);
 
 /// out[j] = dot(x, w[j*k .. (j+1)*k])   (w is [n][k] row-major)
 /// NOTE: kept as a single 8-wide accumulator on purpose. A 4-accumulator / 32-wide
@@ -444,7 +458,7 @@ fn rowDot(out: []f32, x: []const f32, w: []const f32) void {
 
 const V = @Vector(8, f32);
 
-inline fn v8(a: []const f32, o: usize) V {
+inline fn v8(a: []align(1) const f32, o: usize) V {
     return @bitCast(a[o..][0..8].*);
 }
 
@@ -456,6 +470,40 @@ inline fn hsum(v: V) f32 {
 
 inline fn splatv(comptime k: f32) V {
     return @splat(k);
+}
+
+/// Eight weight elements as f32 lanes. F16 -> F32 is a widening with nothing to
+/// round, so half-precision storage changes neither the products nor the
+/// summation order: both instantiations of the kernel agree bit for bit, which is
+/// what `--selftest` and `tools/refcheck.py` check.
+///
+/// The slice has to stay typed. Reading the same bytes out of a `[]const u8` with
+/// a `@bitCast` load costs 8-12x here -- this form compiles to one `vcvtph2ps`
+/// per eight weights.
+inline fn wvec(comptime T: type, w: []align(1) const T, t: usize) V {
+    const h: @Vector(8, T) = @bitCast(w[t..][0..8].*);
+    return @as(V, @floatCast(h));
+}
+
+inline fn wat(comptime T: type, w: []align(1) const T, t: usize) f32 {
+    return @floatCast(w[t]);
+}
+
+/// `dotv` over a weight row; same accumulation order, so f32 and f16 weights give
+/// identical results.
+fn dotvw(comptime T: type, a: []const f32, b: []align(1) const T) f32 {
+    const n = a.len;
+    var a0: V = @splat(0);
+    var a1: V = @splat(0);
+    var i: usize = 0;
+    while (i + 16 <= n) : (i += 16) {
+        a0 = @mulAdd(V, v8(a, i), wvec(T, b, i), a0);
+        a1 = @mulAdd(V, v8(a, i + 8), wvec(T, b, i + 8), a1);
+    }
+    while (i + 8 <= n) : (i += 8) a0 = @mulAdd(V, v8(a, i), wvec(T, b, i), a0);
+    var s: f32 = 0;
+    while (i < n) : (i += 1) s += a[i] * wat(T, b, i);
+    return s + @reduce(.Add, a0 + a1);
 }
 
 /// Elementwise exp for 8 lanes. Range reduction is on the binary exponent, so the
@@ -502,14 +550,18 @@ inline fn geluv(x: V) V {
 /// on FMA latency instead of issuing. Four rows x two tokens = eight independent
 /// chains, which is what it takes to keep both FMA units busy, and each row's
 /// k-sweep stays a straight contiguous stream.
-fn block4(m: *const MM, j: usize) void {
+///
+/// The rows arrive already f32: converting half precision inside this loop would
+/// repeat the same conversion for every token pair, and `vcvtph2ps` issues on the
+/// two ports the FMAs live on, so it costs throughput rather than being free.
+fn block4(m: *const MM, j: usize, w: [4][]align(1) const f32) void {
     const k = m.k;
     const n = m.n;
     const rows = m.rows;
-    const w0 = m.w[j * k ..];
-    const w1 = m.w[(j + 1) * k ..];
-    const w2 = m.w[(j + 2) * k ..];
-    const w3 = m.w[(j + 3) * k ..];
+    const w0 = w[0];
+    const w1 = w[1];
+    const w2 = w[2];
+    const w3 = w[3];
 
     var i: usize = 0;
     while (i < rows) : (i += 2) {
@@ -547,14 +599,18 @@ fn block4(m: *const MM, j: usize) void {
             a13 = @mulAdd(V, p1, y3, a13);
         }
         while (t < k) : (t += 1) {
-            a00[0] = @mulAdd(f32, x0[t], w0[t], a00[0]);
-            a01[0] = @mulAdd(f32, x1[t], w0[t], a01[0]);
-            a02[0] = @mulAdd(f32, x0[t], w1[t], a02[0]);
-            a03[0] = @mulAdd(f32, x1[t], w1[t], a03[0]);
-            a10[0] = @mulAdd(f32, x0[t], w2[t], a10[0]);
-            a11[0] = @mulAdd(f32, x1[t], w2[t], a11[0]);
-            a12[0] = @mulAdd(f32, x0[t], w3[t], a12[0]);
-            a13[0] = @mulAdd(f32, x1[t], w3[t], a13[0]);
+            const c0 = w0[t];
+            const c1 = w1[t];
+            const c2 = w2[t];
+            const c3 = w3[t];
+            a00[0] = @mulAdd(f32, x0[t], c0, a00[0]);
+            a01[0] = @mulAdd(f32, x1[t], c0, a01[0]);
+            a02[0] = @mulAdd(f32, x0[t], c1, a02[0]);
+            a03[0] = @mulAdd(f32, x1[t], c1, a03[0]);
+            a10[0] = @mulAdd(f32, x0[t], c2, a10[0]);
+            a11[0] = @mulAdd(f32, x1[t], c2, a11[0]);
+            a12[0] = @mulAdd(f32, x0[t], c3, a12[0]);
+            a13[0] = @mulAdd(f32, x1[t], c3, a13[0]);
         }
 
         o0[j + 0] = hsum(a00);
@@ -570,6 +626,23 @@ fn block4(m: *const MM, j: usize) void {
     }
 }
 
+/// The four weight rows a block works on.
+fn four(w: []align(1) const f32, k: usize) [4][]align(1) const f32 {
+    return .{ w[0..k], w[k..][0..k], w[2 * k ..][0..k], w[3 * k ..][0..k] };
+}
+
+/// Widen four rows, in the order `block4` reads them. F16 -> F32 has nothing to
+/// round, so this is the same arithmetic done in the same order.
+fn widen4(src: []align(1) const f16, tile: []align(64) f32) void {
+    const n = src.len;
+    var t: usize = 0;
+    while (t + 8 <= n) : (t += 8) {
+        const h: @Vector(8, f16) = @bitCast(src[t..][0..8].*);
+        tile[t..][0..8].* = @bitCast(@as(@Vector(8, f32), @floatCast(h)));
+    }
+    while (t < n) : (t += 1) tile[t] = @floatCast(src[t]);
+}
+
 /// out[i][j] = dot(x[i], w[j]) -- parallelised over 4-column blocks so that each
 /// weight row is streamed exactly once (this is the difference between ~2 s and
 /// ~200 ms per question: the other order re-reads the whole matrix per token).
@@ -578,41 +651,71 @@ fn block4(m: *const MM, j: usize) void {
 /// is given into chunks of an arbitrary size, and a chunk that starts or ends
 /// mid-block falls back to the per-column path below, which reads each weight row
 /// once per token instead of once per four columns.
-fn mmJob(ctx: *anyopaque, blo: usize, bhi: usize) void {
-    const m: *MM = @ptrCast(@alignCast(ctx));
+fn mmJob32(ctx: *anyopaque, blo: usize, bhi: usize) void {
+    const m: *const MM32 = @ptrCast(@alignCast(ctx));
+    const k = m.m.k;
     var b = blo;
     while (b < bhi) : (b += 1) {
         const j = b * 4;
-        if (j + 4 <= m.n) {
-            block4(m, j);
+        if (j + 4 <= m.m.n) {
+            block4(&m.m, j, four(m.w[j * k ..], k));
             continue;
         }
         var jj = j;
-        while (jj < m.n) : (jj += 1) {
-            const wrow = m.w[jj * m.k ..][0..m.k];
-            for (0..m.rows) |i| m.out[i * m.n + jj] = dotv(m.x[i * m.k ..][0..m.k], wrow);
+        while (jj < m.m.n) : (jj += 1) {
+            const wrow = m.w[jj * k ..][0..k];
+            for (0..m.m.rows) |i| m.m.out[i * m.m.n + jj] = dotvw(f32, m.m.x[i * k ..][0..k], wrow);
         }
     }
 }
 
+/// The same sweep over half-precision weights. Each block is widened once into a
+/// tile on this thread's stack and then reused by every token pair, which is what
+/// keeps the conversions at one per weight element instead of one per pair.
+fn mmJob16(ctx: *anyopaque, blo: usize, bhi: usize) void {
+    const m: *const MM16 = @ptrCast(@alignCast(ctx));
+    const k = m.m.k;
+    var buf: [4 * tile_k_max]f32 align(64) = undefined;
+    const tile: []align(64) f32 = (&buf)[0..];
+    var b = blo;
+    while (b < bhi) : (b += 1) {
+        const j = b * 4;
+        if (j + 4 <= m.m.n) {
+            widen4(m.w[j * k ..][0 .. 4 * k], tile);
+            block4(&m.m, j, four(tile[0 .. 4 * k], k));
+            continue;
+        }
+        var jj = j;
+        while (jj < m.m.n) : (jj += 1) {
+            const wrow = m.w[jj * k ..][0..k];
+            for (0..m.m.rows) |i| m.m.out[i * m.m.n + jj] = dotvw(f16, m.m.x[i * k ..][0..k], wrow);
+        }
+    }
+}
+
+const Bias = struct { out: []f32, b: []const f32, n: usize };
+
 fn biasJob(ctx: *anyopaque, lo: usize, hi: usize) void {
-    const m: *MM = @ptrCast(@alignCast(ctx));
+    const m: *Bias = @ptrCast(@alignCast(ctx));
     for (lo..hi) |i| {
         const row = m.out[i * m.n ..][0..m.n];
-        for (row, 0..) |*v, j| v.* += m.w[j];
+        for (row, 0..) |*v, j| v.* += m.b[j];
     }
 }
 
 fn matmul(alloc: Allocator, out: []f32, x: []const f32, w: []const f32, rows: usize, n: usize, k: usize) void {
-    var m = MM{ .out = out, .x = x, .w = w, .n = n, .k = k, .rows = rows };
-    parallel(alloc, (n + 3) / 4, &m, mmJob);
+    var m = MM32{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
+    parallel(alloc, (n + 3) / 4, &m, mmJob32);
 }
 
-fn linear(alloc: Allocator, out: []f32, x: []const f32, w: []const f32, bias: ?[]const f32, rows: usize, n: usize, k: usize) void {
-    matmul(alloc, out, x, w, rows, n, k);
+/// F16 weights straight out of the file, converted inside the kernel: no 478 MB
+/// F32 copy, and half the bytes streamed per forward.
+fn linear16(alloc: Allocator, out: []f32, x: []const f32, w: []align(1) const f16, bias: ?[]const f32, rows: usize, n: usize, k: usize) void {
+    var m = MM16{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
+    parallel(alloc, (n + 3) / 4, &m, mmJob16);
     if (bias) |b| {
-        var m = MM{ .out = out, .x = &[0]f32{}, .w = b, .n = n, .k = 0, .rows = rows };
-        parallel(alloc, rows, &m, biasJob);
+        var bias_job = Bias{ .out = out, .b = b, .n = n };
+        parallel(alloc, rows, &bias_job, biasJob);
     }
 }
 
@@ -683,6 +786,25 @@ fn tensorF32(alloc: Allocator, infos: *const std.StringHashMap(TensorInfo), data
         return error.MissingTensor;
     };
     return try toF32(alloc, data[t.offset .. t.offset + t.len], t.dtype);
+}
+
+/// A matrix the kernels consume as half precision: a view of the file image, so
+/// it costs no memory beyond the mapping itself.
+fn tensorF16(infos: *const std.StringHashMap(TensorInfo), data: []const u8, name: []const u8) ![]align(1) const f16 {
+    const t = infos.get(name) orelse {
+        std.debug.print("missing tensor: {s}\n", .{name});
+        return error.MissingTensor;
+    };
+    if (!std.mem.eql(u8, t.dtype, "F16")) {
+        std.debug.print("tensor {s} is {s}, expected F16\n", .{ name, t.dtype });
+        return error.UnsupportedDtype;
+    }
+    const raw = data[t.offset .. t.offset + t.len];
+    if (raw.len % 2 != 0) {
+        std.debug.print("tensor {s} has an odd byte length\n", .{name});
+        return error.BadSafetensors;
+    }
+    return @ptrCast(raw);
 }
 
 // --------------------------------------------------------------------------- tokenizer
@@ -1188,10 +1310,10 @@ fn encodeAll(tok: *const Tokenizer, alloc: Allocator, text: []const u8) ![]u32 {
 
 // --------------------------------------------------------------------------- weights
 const EncLayer = struct {
-    wqkv: []const f32,
-    wo: []const f32,
-    wi: []const f32,
-    wo2: []const f32,
+    wqkv: []align(1) const f16,
+    wo: []align(1) const f16,
+    wi: []align(1) const f16,
+    wo2: []align(1) const f16,
     attn_norm: ?[]const f32,
     mlp_norm: []const f32,
     sliding: bool,
@@ -1202,13 +1324,13 @@ const HeadLayer = struct {
     norm1_b: []const f32,
     norm2_w: []const f32,
     norm2_b: []const f32,
-    in_proj_w: []const f32,
+    in_proj_w: []align(1) const f16,
     in_proj_b: []const f32,
-    out_proj_w: []const f32,
+    out_proj_w: []align(1) const f16,
     out_proj_b: []const f32,
-    lin1_w: []const f32,
+    lin1_w: []align(1) const f16,
     lin1_b: []const f32,
-    lin2_w: []const f32,
+    lin2_w: []align(1) const f16,
     lin2_b: []const f32,
 };
 
@@ -1255,11 +1377,22 @@ const Cfg = struct {
     head_max_len: usize = HEAD_MAX_LEN,
 };
 
+/// The weights are a view of `model.safetensors`, not a copy: 614 MB of private
+/// commit becomes demand-paged file memory the OS can drop and re-read at will.
+/// `m.emb_raw` points into it, so it lives as long as the process.
+var g_weights: ?std.Io.File.MemoryMap = null;
+
 fn loadModel(alloc: Allocator, io: std.Io, dir: []const u8, cfg: *const Cfg) !struct { Model, []u8 } {
     const path = try std.fs.path.join(alloc, &.{ dir, "model.safetensors" });
     defer alloc.free(path);
-    const data = try readFile(alloc, io, path);
-    errdefer alloc.free(data);
+    var data: []u8 = undefined;
+    if (mapFile(io, path)) |mm| {
+        g_weights = mm;
+        data = mm.memory;
+    } else |_| data = try readFile(alloc, io, path);
+    // Only the fallback copy is ours to free; unmapping a view with
+    // alloc.free would hand the allocator a pointer it never handed out.
+    errdefer if (g_weights == null) alloc.free(data);
 
     if (data.len < 8) return error.BadSafetensors;
     const hdr_len = std.mem.readInt(u64, data[0..8], .little);
@@ -1297,10 +1430,10 @@ fn loadModel(alloc: Allocator, io: std.Io, dir: []const u8, cfg: *const Cfg) !st
         var an: ?[]const f32 = null;
         if (l > 0) an = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn_norm.weight", .{pfx}));
         m.layers[l] = .{
-            .wqkv = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wqkv.weight", .{pfx})),
-            .wo = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wo.weight", .{pfx})),
-            .wi = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wi.weight", .{pfx})),
-            .wo2 = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wo.weight", .{pfx})),
+            .wqkv = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wqkv.weight", .{pfx})),
+            .wo = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wo.weight", .{pfx})),
+            .wi = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wi.weight", .{pfx})),
+            .wo2 = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wo.weight", .{pfx})),
             .attn_norm = an,
             .mlp_norm = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp_norm.weight", .{pfx})),
             // config: layer_types[i] == "full_attention" iff i % global_attn_every_n_layers == 0 (3)
@@ -1315,13 +1448,13 @@ fn loadModel(alloc: Allocator, io: std.Io, dir: []const u8, cfg: *const Cfg) !st
             .norm1_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm1.bias", .{pfx})),
             .norm2_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm2.weight", .{pfx})),
             .norm2_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm2.bias", .{pfx})),
-            .in_proj_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.in_proj_weight", .{pfx})),
+            .in_proj_w = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.in_proj_weight", .{pfx})),
             .in_proj_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.in_proj_bias", .{pfx})),
-            .out_proj_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.out_proj.weight", .{pfx})),
+            .out_proj_w = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.out_proj.weight", .{pfx})),
             .out_proj_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.out_proj.bias", .{pfx})),
-            .lin1_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear1.weight", .{pfx})),
+            .lin1_w = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}linear1.weight", .{pfx})),
             .lin1_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear1.bias", .{pfx})),
-            .lin2_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear2.weight", .{pfx})),
+            .lin2_w = try tensorF16(&infos, data, try std.fmt.bufPrint(&nm, "{s}linear2.weight", .{pfx})),
             .lin2_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear2.bias", .{pfx})),
         };
     }
@@ -1604,7 +1737,7 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
             attn_in = s.xn;
         }
         g_stage = ST_MATMUL;
-        linear(alloc, s.qkv, attn_in, lay.wqkv, null, L, 3 * D, D);
+        linear16(alloc, s.qkv, attn_in, lay.wqkv, null, L, 3 * D, D);
         g_stage = ST_SPLIT;
         splitQkv(alloc, s.q, s.k, s.v, s.qkv, L);
         g_stage = ST_ROPE;
@@ -1624,18 +1757,18 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         };
         parallel(alloc, L, &aj, attWorker);
         g_stage = ST_MATMUL;
-        linear(alloc, s.xn, s.ctx, lay.wo, null, L, D, D);
+        linear16(alloc, s.xn, s.ctx, lay.wo, null, L, D, D);
         g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
 
         g_stage = ST_NORM;
         normInto(alloc, s.x, s.xn, L, lay.mlp_norm, null);
         g_stage = ST_MATMUL;
-        linear(alloc, s.mlp, s.xn, lay.wi, null, L, 2 * INTER, D);
+        linear16(alloc, s.mlp, s.xn, lay.wi, null, L, 2 * INTER, D);
         g_stage = ST_GELU;
         parallel(alloc, L, f, mlpJob);
         g_stage = ST_MATMUL;
-        linear(alloc, s.xn, s.mlp2, lay.wo2, null, L, D, INTER);
+        linear16(alloc, s.xn, s.mlp2, lay.wo2, null, L, D, INTER);
         g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
         if (dumping) {
@@ -1657,7 +1790,7 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         g_stage = ST_NORM;
         normInto(alloc, s.x, s.xn, L, hl.norm1_w, hl.norm1_b);
         g_stage = ST_MATMUL;
-        linear(alloc, s.qkv, s.xn, hl.in_proj_w, hl.in_proj_b, L, 3 * D, D);
+        linear16(alloc, s.qkv, s.xn, hl.in_proj_w, hl.in_proj_b, L, 3 * D, D);
         g_stage = ST_SPLIT;
         splitQkv(alloc, s.q, s.k, s.v, s.qkv, L);
         g_stage = ST_ATTN;
@@ -1673,18 +1806,18 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         };
         parallel(alloc, L, &aj, attWorker);
         g_stage = ST_MATMUL;
-        linear(alloc, s.xn, s.ctx, hl.out_proj_w, hl.out_proj_b, L, D, D);
+        linear16(alloc, s.xn, s.ctx, hl.out_proj_w, hl.out_proj_b, L, D, D);
         g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
 
         g_stage = ST_NORM;
         normInto(alloc, s.x, s.xn, L, hl.norm2_w, hl.norm2_b);
         g_stage = ST_MATMUL;
-        linear(alloc, s.ff, s.xn, hl.lin1_w, hl.lin1_b, L, HEAD_FF, D);
+        linear16(alloc, s.ff, s.xn, hl.lin1_w, hl.lin1_b, L, HEAD_FF, D);
         g_stage = ST_GELU;
         parallel(alloc, L, f, reluJob);
         g_stage = ST_MATMUL;
-        linear(alloc, s.xn, s.ff, hl.lin2_w, hl.lin2_b, L, D, HEAD_FF);
+        linear16(alloc, s.xn, s.ff, hl.lin2_w, hl.lin2_b, L, D, HEAD_FF);
         g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
         if (dumping) {
@@ -2231,6 +2364,18 @@ fn readFile(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     return buf[0..got];
 }
 
+/// The weight file as a read-only view instead of a copy. On Windows this is a
+/// section plus a mapping of it, so the handle has to stay open for as long as
+/// the view is used -- `MemoryMap` keeps it for exactly that reason.
+fn mapFile(io: std.Io, path: []const u8) !std.Io.File.MemoryMap {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    const st = try f.stat(io);
+    return f.createMemoryMap(io, .{
+        .len = @intCast(st.size),
+        .protection = .{ .read = true },
+    });
+}
+
 const DEMO_JSON =
     \\{"state":"मुझसे इनवॉइस 4411 के लिए दो बार शुल्क लिया गया। कृपया आज ही धनवापसी करें।",
     \\ "questions":{
@@ -2379,10 +2524,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (g_threads == 0) {
-        // Measured here (4 P-cores + 8 E-cores, 16 logical): a ~340-token Snake
-        // decision takes 296 ms at 8 threads, 253 ms at 12, 412 ms at 16 -- the
-        // barrier waits for the slowest straggler once every logical CPU is busy.
-        if (std.Thread.getCpuCount()) |n| g_threads = @max(1, @min(n, 12)) else |_| {
+        // Measured here (4 P-cores + 8 E-cores, 16 logical): on the 60-180 token
+        // prompts this model actually sees, 8 threads is as quick as 12 and costs
+        // a third of the CPU-seconds -- the last four only add a straggler for the
+        // barrier to wait on. Past ~300 tokens 12 wins again (~15% on a 634).
+        if (std.Thread.getCpuCount()) |n| g_threads = @max(1, @min(n, 8)) else |_| {
             g_threads = 4;
         }
     }

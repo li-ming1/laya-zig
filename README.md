@@ -6,10 +6,10 @@
 >
 > This is about **two hours of work**, from "can this model run outside Python?"
 > to a working port. It runs end to end and the forward pass is checked against an
-> independent reference implementation, and it has had one serious performance
-> pass (see *Measured* — a Snake decision costs ~200 ms on a laptop CPU), but
-> treat it as a **half-finished project**: expect rough edges and missing
-> features. It has not been used in anything real.
+> independent reference implementation, and it has had two serious performance
+> passes (see *Measured* — a Snake decision costs ~170 ms on a laptop CPU, in
+> ~330 MB of memory), but treat it as a **half-finished project**: expect rough
+> edges and missing features. It has not been used in anything real.
 >
 > Issues, corrections and pull requests are welcome.
 
@@ -31,8 +31,8 @@ and its training come from
 [Convai Innovations](https://github.com/NandhaKishorM/laya).
 
 This repository is an independent **Zig re-implementation of the same weights**,
-aiming at a single dependency-free binary that reads 614 MB of weights and starts
-answering in about half a second, offline.
+aiming at a single dependency-free binary that maps 614 MB of weights and starts
+answering in about a third of a second, offline.
 
 ## Highlights
 
@@ -45,49 +45,78 @@ answering in about half a second, offline.
 - **8-wide SIMD, multi-threaded GEMM**, split over output columns so each weight row
   is streamed from memory exactly once. Every other stage — softmax, RoPE, GLU,
   the norms, the QKV split — is vectorized and threaded too, which is what brings
-  a Snake decision down to ~200 ms on a laptop CPU.
+  a Snake decision down to ~170 ms on a laptop CPU.
 - **Verifiable** — three checks, listed below. Not "it seems to run": the forward
   pass is aligned layer by layer.
 
 ## Measured
 
-i5-1240P (4 P-cores + 8 E-cores, 12C/16T), 16 GB, Windows, `-mcpu=native`,
-12 threads (auto). Each column is a median over repeated runs, and the width of
-the range *is* the machine: sustained clocks after a few minutes of load are ~20 %
-slower than the first runs, so before/after were measured in the same state —
-cooled down first, then the same pair again hot. "Before" is the previous commit,
-built the same way on the same box.
+i5-1240P (4 P-cores + 8 E-cores, 12C/16T), 16 GB, Windows, `-mcpu=native`.
+"Before" is the previous commit (`62bc212`), built the same way on the same box;
+"now" is this tree, 8 threads (auto). Every pair below was measured *rotated* —
+before, after, after, before, alternating — because sustained clocks after a few
+minutes of load are ~20 % slower than the first runs, and a batch of "before"
+followed by a batch of "after" measures the thermometer, not the code.
 
-| | before | now | speedup |
-|---|---|---|---|
-| built-in demo, 2 questions (63 + 64 tokens) | 844–1017 ms | **124–143 ms** | ~7× |
-| Snake, one decision (175–180 tokens) | 1909–2160 ms | **202–224 ms** | ~9.5× |
-| weights load (614 MB f16 → f32) | 593–708 ms | **376–406 ms** | ~1.7× |
-| tokenizer load (256k vocab / 580,604 merges / 249 added) | 136–151 ms | 137–153 ms | — |
-| resident set | 1177 MB | 1177 MB | — |
+### Latency
 
-The Snake row is what decides whether the browser UI feels live: at ~200 ms per
-move the game gets 5 decisions a second. That median is taken over a 6-move game;
-the fastest single move was 901 ms before and 174 ms now, and the old code got
-*worse* as the game went on (spawn-per-call plus thermal drift) while the new one
-holds roughly flat.
+| | before | now |
+|---|---|---|
+| built-in demo, end to end (2 questions, 63 + 64 tokens) | 659–667 ms | **329–382 ms** |
+| built-in demo, the two forwards only | 106–143 ms | 146–161 ms |
+| Snake, one decision (175–180 tokens), moves 2–6 | 155–194 ms | 157–189 ms |
+| Snake, the *first* decision of the process | 155–186 ms | 183–258 ms |
+| weights load (614 MB) | 376–406 ms | **3–7 ms** |
+| tokenizer load (256k vocab / 580,604 merges / 249 added) | 137–153 ms | 137–153 ms |
+
+The trade these rows describe is real and worth stating: the weights are
+no longer widened into an f32 copy at startup, so startup went from ~0.4 s to
+~0.005 s, but the first forward now pays for the pages the OS pulls in from the
+file cache — somewhere between 30 and 90 ms, once, per process. After that first
+decision the speed is the same as before, within the noise of this machine, and
+end-to-end a cold process answers the demo's first question roughly twice as
+fast.
+
+### Cost
+
+| | before | now |
+|---|---|---|
+| demo, CPU-seconds | 2906 ms | **1328–1562 ms** |
+| Snake game (6 decisions), CPU-seconds | 16.0–16.8 s | **9.0–10.9 s** |
+| peak working set | 1171–1177 MB | **322–328 MB** |
+| peak private bytes | 1433–1486 MB | **169–222 MB** |
+| `--serve` sitting idle for 10 s | 0 ms CPU, 1167 MB working set | 0 ms CPU, **81 MB** working set |
+
+Private bytes are the part the OS cannot take back; the rest is the weight file,
+mapped read-only, so it is just the system file cache and is evictable — which is
+why the idle server drops to 81 MB and why it can never be 614 MB again on a box
+that is short of memory.
 
 Neither column trades accuracy for speed — both print bit-identical probabilities
 and choices. `--selftest` puts the worst GEMM relative error at 7.98e-6 against
-f64, and `tools/refcheck.py` recomputes all 22 layers plus both heads in
-independent Python and agrees to 2.6e-5.
+f64, `--dumpstats` dumps match byte for byte, and `tools/refcheck.py` recomputes
+all 22 layers plus both heads in independent Python and agrees to 2.6e-5.
 
-`--profile` says where that time goes: matmul 84 %, attention 6 %, norm 3 %,
-residual 3 %, RoPE 1 %, GLU 1 %, QKV split 1 %. The matmul streams 441 MB of f32
-weights per forward at ~250 GFLOP/s; the plumbing under it is now single-digit
-milliseconds total, so what is left is in the GEMM kernel itself — or in keeping
-the weights as f16 and converting inside the kernel, which would halve both the
-streaming and the 1177 MB resident set, at a cost this chip may not pay back.
+`--profile` says where the time goes: matmul 91 %, attention 4 %, norm 1.5 %,
+RoPE / GLU / QKV-split / serial ~0.6 % each, residual 0.4 %, embedding 0.1 %. The
+matmul streams 239 MB of f16 per forward instead of the 441 MB of f32 it used to,
+which is why the same kernel is the same speed while holding a fifth of the
+memory. Everything outside matmul is now ~14 ms of a ~150 ms forward.
 
-Thread count defaults to `min(cores, 12)`. Measured on this CPU for the demo:
-253 ms at 4 threads, 170 at 8, 153 at 12, **640 at 16**. Past one thread per
-physical core, more threads is not more parallel — it is oversubscribed SMT, and
-every barrier waits for the slowest straggler.
+Thread count defaults to `min(cores, 8)`, chosen on CPU cost rather than on
+latency:
+
+| | 8 threads | 12 threads | 16 threads |
+|---|---|---|---|
+| Snake game, wall | 1.31–1.56 s | 1.42–1.45 s | 2.24–2.31 s |
+| Snake game, CPU | 9.0–10.9 s | 14.4 s | 28.2 s |
+| demo, wall | 368–375 ms | 312–337 ms | 497–512 ms |
+| demo, CPU | 1.41–1.47 s | 1.56–1.58 s | 4.42–4.45 s |
+
+Twelve threads is ~10 % quicker on the two-question demo and no quicker on a
+Snake decision, for 30–60 % more CPU-seconds. Sixteen — one per logical CPU,
+which sounds like the obvious guess — is slower *and* three times the CPU: the
+barrier waits for the slowest SMT straggler.
 
 For reference, the upstream implementation needs ~33 ms per question on a T4.
 This is what a plain CPU costs with zero dependencies.
@@ -281,9 +310,12 @@ confidence, cycle length and repeat count, and the three-way comparison table.
 ## Limitations
 
 - **CPU only**, no GPU backend.
-- **No mmap**: the 614 MB of weights are read into memory, ~700 MB resident with
-  activations.
-- **f32 math** (upstream uses bf16/fp16 on GPU).
+- **f32 arithmetic** on f16 weights (upstream runs bf16/fp16 on GPU). The weights
+  are never widened in memory: the GEMM converts four columns at a time.
+- The weights are reached through a memory mapping, so `model.safetensors` stays
+  open for the life of the process — on Windows that means it cannot be deleted or
+  replaced while a server is running. If the mapping fails, the loader falls back
+  to a plain read (~0.4 s, ~1.4 GB).
 - **No batching**: one question per forward pass, several questions run
   sequentially. Upstream batches them.
 - Upstream's `temperature_by_options` buckets are not implemented (the table is
