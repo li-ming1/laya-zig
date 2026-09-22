@@ -6,9 +6,10 @@
 >
 > This is about **two hours of work**, from "can this model run outside Python?"
 > to a working port. It runs end to end and the forward pass is checked against an
-> independent reference implementation, but treat it as a **half-finished
-> project**: expect rough edges, missing features, and no serious performance
-> tuning yet. It has not been used in anything real.
+> independent reference implementation, and it has had one serious performance
+> pass (see *Measured* — a Snake decision costs ~200 ms on a laptop CPU), but
+> treat it as a **half-finished project**: expect rough edges and missing
+> features. It has not been used in anything real.
 >
 > Issues, corrections and pull requests are welcome.
 
@@ -30,7 +31,8 @@ and its training come from
 [Convai Innovations](https://github.com/NandhaKishorM/laya).
 
 This repository is an independent **Zig re-implementation of the same weights**,
-aiming at a single dependency-free binary that starts instantly and works offline.
+aiming at a single dependency-free binary that reads 614 MB of weights and starts
+answering in about half a second, offline.
 
 ## Highlights
 
@@ -41,26 +43,54 @@ aiming at a single dependency-free binary that starts instantly and works offlin
   feed-forward, option-marker scoring, act/escalate head, ported layer by layer
   from the upstream reference implementation.
 - **8-wide SIMD, multi-threaded GEMM**, split over output columns so each weight row
-  is streamed from memory exactly once. That one decision is the difference between
-  ~2 s and ~200 ms per question.
+  is streamed from memory exactly once. Every other stage — softmax, RoPE, GLU,
+  the norms, the QKV split — is vectorized and threaded too, which is what brings
+  a Snake decision down to ~200 ms on a laptop CPU.
 - **Verifiable** — three checks, listed below. Not "it seems to run": the forward
   pass is aligned layer by layer.
 
 ## Measured
 
-i5-1240P (12C/16T), 16 GB, Windows, `-mcpu=native`, 8 threads (auto).
+i5-1240P (4 P-cores + 8 E-cores, 12C/16T), 16 GB, Windows, `-mcpu=native`,
+12 threads (auto). Each column is a median over repeated runs, and the width of
+the range *is* the machine: sustained clocks after a few minutes of load are ~20 %
+slower than the first runs, so before/after were measured in the same state —
+cooled down first, then the same pair again hot. "Before" is the previous commit,
+built the same way on the same box.
 
-| | measured |
-|---|---|
-| weights load (614 MB, f16) | **528 ms** |
-| tokenizer load (256k vocab / 580,604 merges / 249 added) | **122 ms** |
-| built-in demo (2 questions, 63 + 64 tokens) | forward **615–640 ms** |
-| Snake probe (single question, 166–169 tokens) | **618–741 ms per move** |
+| | before | now | speedup |
+|---|---|---|---|
+| built-in demo, 2 questions (63 + 64 tokens) | 844–1017 ms | **124–143 ms** | ~7× |
+| Snake, one decision (175–180 tokens) | 1909–2160 ms | **202–224 ms** | ~9.5× |
+| weights load (614 MB f16 → f32) | 593–708 ms | **376–406 ms** | ~1.7× |
+| tokenizer load (256k vocab / 580,604 merges / 249 added) | 136–151 ms | 137–153 ms | — |
+| resident set | 1177 MB | 1177 MB | — |
 
-That is the price of a plain CPU with zero dependencies. For reference, the
-upstream implementation needs ~33 ms per question on a T4. Thread count defaults
-to `min(cores, 8)`: past 8 threads the matmul is memory-latency bound and gets
-slower.
+The Snake row is what decides whether the browser UI feels live: at ~200 ms per
+move the game gets 5 decisions a second. That median is taken over a 6-move game;
+the fastest single move was 901 ms before and 174 ms now, and the old code got
+*worse* as the game went on (spawn-per-call plus thermal drift) while the new one
+holds roughly flat.
+
+Neither column trades accuracy for speed — both print bit-identical probabilities
+and choices. `--selftest` puts the worst GEMM relative error at 7.98e-6 against
+f64, and `tools/refcheck.py` recomputes all 22 layers plus both heads in
+independent Python and agrees to 2.6e-5.
+
+`--profile` says where that time goes: matmul 84 %, attention 6 %, norm 3 %,
+residual 3 %, RoPE 1 %, GLU 1 %, QKV split 1 %. The matmul streams 441 MB of f32
+weights per forward at ~250 GFLOP/s; the plumbing under it is now single-digit
+milliseconds total, so what is left is in the GEMM kernel itself — or in keeping
+the weights as f16 and converting inside the kernel, which would halve both the
+streaming and the 1177 MB resident set, at a cost this chip may not pay back.
+
+Thread count defaults to `min(cores, 12)`. Measured on this CPU for the demo:
+253 ms at 4 threads, 170 at 8, 153 at 12, **640 at 16**. Past one thread per
+physical core, more threads is not more parallel — it is oversubscribed SMT, and
+every barrier waits for the slowest straggler.
+
+For reference, the upstream implementation needs ~33 ms per question on a T4.
+This is what a plain CPU costs with zero dependencies.
 
 ## Getting started
 
@@ -149,7 +179,7 @@ byte-identical input to upstream.
 |---|---|
 | `--json FILE` | use your own state and questions |
 | `--dir DIR` | model directory (default `.`) |
-| `--threads N` | thread count (default `min(cores, 8)`) |
+| `--threads N` | thread count (default `min(cores, 12)`) |
 | `--serve [--port N]` | local browser UI (default 8080) |
 | `--snake` | let the model play Snake, one frame per move |
 | `--snake --games N` | N games, summary only |
@@ -157,6 +187,7 @@ byte-identical input to upstream.
 | `--snake --prompt` | print the board text handed to the model |
 | `--size N --seed N --max-steps N --delay MS` | Snake options (default 10 / 12345 / 400 / 0) |
 | `--selftest` | SIMD kernels vs f64 |
+| `--profile` | print where each forward spends its time, by stage |
 | `--dumpstats` | per-layer hidden-state fingerprints, for `tools/refcheck.py` |
 | `--tokcheck FILE` | validate the tokenizer against golden samples |
 | `--debug` | print marker positions and logits |

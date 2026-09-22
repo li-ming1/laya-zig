@@ -18,6 +18,7 @@
 //! misc:   --selftest               check the SIMD kernels against f64 (run after
 //!                                 touching dotv/matmul — they have been miscompiled
 //!                                 by this zig build before)
+//!         --profile                print where the forward pass spends its time
 //!
 //! snake:  --snake                let the model play Snake (one game, animated board)
 //!         --snake --games 10     summary over N games, no animation
@@ -93,7 +94,7 @@ fn layerNorm(x: []f32, w: []const f32, b: ?[]const f32) void {
 }
 
 // --------------------------------------------------------------------------- threading
-var g_threads: usize = 4;
+var g_threads: usize = 0; // 0 = pick from the CPU count in main
 var g_debug: bool = false;
 
 /// `--dumpstats`: after every encoder layer, print a few numbers describing the
@@ -123,49 +124,194 @@ fn dumpIds(ids: []const u32) void {
     }
 }
 
-const RangeJob = struct {
-    ctx: *anyopaque,
-    f: *const fn (*anyopaque, usize, usize) void,
-    lo: usize,
-    hi: usize,
-};
+/// `--profile`: per-stage timing of the forward pass. Worker threads have no
+/// std.Io to read a clock with, so this goes straight to QueryPerformanceCounter.
+var g_prof: bool = false;
+var g_qpc_freq: i64 = 1_000_000_000;
 
-fn rangeWorker(job: RangeJob) void {
-    if (job.hi > job.lo) job.f(job.ctx, job.lo, job.hi);
+extern "kernel32" fn QueryPerformanceCounter(lpLargeInteger: *i64) callconv(.winapi) i32;
+extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) i32;
+
+fn nowNs() i64 {
+    var c: i64 = undefined;
+    _ = QueryPerformanceCounter(&c);
+    return @divTrunc(c * std.time.ns_per_s, g_qpc_freq);
 }
 
-fn parallel(alloc: Allocator, n: usize, ctx: *anyopaque, f: *const fn (*anyopaque, usize, usize) void) void {
+const STAGE_NAMES = [_][]const u8{
+    "matmul",   "attention", "norm",     "rope",   "glu+gelu",
+    "residual", "embed",     "splitQkv", "serial",
+};
+const ST_MATMUL: u8 = 0;
+const ST_ATTN: u8 = 1;
+const ST_NORM: u8 = 2;
+const ST_ROPE: u8 = 3;
+const ST_GELU: u8 = 4;
+const ST_RES: u8 = 5;
+const ST_EMB: u8 = 6;
+const ST_SPLIT: u8 = 7;
+const ST_SERIAL: u8 = 8;
+
+fn zeroI64s() [STAGE_NAMES.len]i64 {
+    var a: [STAGE_NAMES.len]i64 = undefined;
+    @memset(&a, 0);
+    return a;
+}
+
+var g_stage: u8 = ST_SERIAL;
+var g_stage_ns = zeroI64s();
+var g_stage_calls = zeroI64s();
+
+fn profAdd(stage: u8, ns: i64) void {
+    g_stage_ns[stage] += ns;
+    g_stage_calls[stage] += 1;
+}
+
+fn profReset() void {
+    @memset(&g_stage_ns, 0);
+    @memset(&g_stage_calls, 0);
+}
+
+fn profReport(w: *std.Io.Writer) !void {
+    var tot: i64 = 0;
+    for (g_stage_ns) |v| tot += v;
+    if (tot == 0) return;
+    try w.print("\n[profile] {d} threads, {d} ms of measured stage time\n", .{ g_threads, @as(f64, @floatFromInt(tot)) / 1e6 });
+    for (STAGE_NAMES, 0..) |name, i| {
+        if (g_stage_ns[i] == 0) continue;
+        const ms = @as(f64, @floatFromInt(g_stage_ns[i])) / 1e6;
+        const pct = @as(f64, @floatFromInt(g_stage_ns[i])) * 100.0 / @as(f64, @floatFromInt(tot));
+        try w.print("  {s:<9} {d:>8.1} ms {d:>6.1}% {d:>7} calls\n", .{ name, ms, pct, g_stage_calls[i] });
+    }
+    try w.flush();
+}
+
+const JobFn = *const fn (ctx: *anyopaque, lo: usize, hi: usize) void;
+
+/// Worker threads created once and parked between jobs. The previous code spawned
+/// and joined `--threads` OS threads for every parallel() call, and with ~250 calls
+/// per forward pass that cost more than every matmul in it (see --profile).
+const Pool = struct {
+    /// a job smaller than this per thread is not worth a barrier
+    const min_per_thread: usize = 16;
+    /// how long a worker spins before parking: longer than the gap between two
+    /// back-to-back jobs, so a forward pass never pays a futex round-trip
+    const spin_budget: u32 = 30_000;
+
+    job_ctx: *anyopaque = undefined,
+    job_f: JobFn = undefined,
+    job_n: usize = 0,
+    job_chunk: usize = 1,
+    job_chunks: usize = 0,
+
+    gen: std.atomic.Value(u64) = .init(0),
+    next: std.atomic.Value(usize) = .init(0),
+    live: std.atomic.Value(usize) = .init(0),
+    parked: std.atomic.Value(usize) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+
+    threads: AList(std.Thread) = undefined,
+    nworkers: usize = 0,
+
+    /// hand out index ranges until the job is exhausted
+    fn drain(self: *Pool) void {
+        const f = self.job_f;
+        const ctx = self.job_ctx;
+        const n = self.job_n;
+        const chunk = self.job_chunk;
+        const chunks = self.job_chunks;
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= chunks) return;
+            const lo = i * chunk;
+            const hi = @min(lo + chunk, n);
+            f(ctx, lo, hi);
+        }
+    }
+
+    fn worker(self: *Pool) void {
+        var seen: u64 = 0;
+        while (true) {
+            var spins: u32 = 0;
+            while (true) {
+                const g = self.gen.load(.acquire);
+                if (g != seen) {
+                    seen = g;
+                    break;
+                }
+                if (self.stop.load(.acquire)) return;
+                spins += 1;
+                if (spins < spin_budget) std.atomic.spinLoopHint() else self.park(seen);
+            }
+            if (self.stop.load(.acquire)) return;
+            self.drain();
+            _ = self.live.fetchSub(1, .release);
+        }
+    }
+
+    fn park(self: *Pool, seen: u64) void {
+        _ = self.parked.fetchAdd(1, .monotonic);
+        if (self.gen.load(.acquire) == seen and !self.stop.load(.acquire)) {
+            _ = std.os.windows.ntdll.RtlWaitOnAddress(&self.gen.raw, &seen, @sizeOf(u64), null);
+        }
+        _ = self.parked.fetchSub(1, .monotonic);
+    }
+
+    fn run(self: *Pool, n: usize, ctx: *anyopaque, f: JobFn) void {
+        const nw = self.nworkers;
+        if (nw == 0 or n / min_per_thread == 0) {
+            f(ctx, 0, n);
+            return;
+        }
+        const nt = @min(nw + 1, n / min_per_thread + 1);
+        const chunk = @max(1, (n + nt * 4 - 1) / (nt * 4));
+        self.job_ctx = ctx;
+        self.job_f = f;
+        self.job_n = n;
+        self.job_chunk = chunk;
+        self.job_chunks = (n + chunk - 1) / chunk;
+        self.next.store(0, .monotonic);
+        self.live.store(nw, .monotonic);
+        _ = self.gen.fetchAdd(1, .release);
+        if (self.parked.load(.acquire) != 0) std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
+        self.drain();
+        var spins: u32 = 0;
+        while (self.live.load(.acquire) != 0) {
+            spins += 1;
+            if (spins < 2000) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+        }
+    }
+
+    fn start(self: *Pool, alloc: Allocator, nt: usize) void {
+        self.threads = AList(std.Thread).init(alloc);
+        for (1..nt) |_| {
+            const t = std.Thread.spawn(.{}, worker, .{self}) catch break;
+            self.threads.append(t) catch break;
+            self.nworkers += 1;
+        }
+    }
+
+    fn stopAll(self: *Pool) void {
+        self.stop.store(true, .release);
+        std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
+        for (self.threads.items) |t| t.join();
+        self.threads.deinit();
+        self.nworkers = 0;
+    }
+};
+
+var g_pool: Pool = .{};
+
+fn parallel(alloc: Allocator, n: usize, ctx: *anyopaque, f: JobFn) void {
+    _ = alloc;
     if (n == 0) return;
-    var nt = g_threads;
-    if (n < 64) nt = 1;
-    if (nt <= 1) {
-        f(ctx, 0, n);
+    if (!g_prof) {
+        g_pool.run(n, ctx, f);
         return;
     }
-    const chunk = (n + nt - 1) / nt;
-    const threads = alloc.alloc(std.Thread, nt - 1) catch {
-        f(ctx, 0, n);
-        return;
-    };
-    defer alloc.free(threads);
-    var spawned: usize = 0;
-    for (0..nt - 1) |t| {
-        const lo = @min(t * chunk, n);
-        const hi = @min(lo + chunk, n);
-        threads[t] = std.Thread.spawn(.{}, rangeWorker, .{RangeJob{
-            .ctx = ctx,
-            .f = f,
-            .lo = lo,
-            .hi = hi,
-        }}) catch break;
-        spawned = t + 1;
-    }
-    for (spawned..nt) |t| {
-        const lo = @min(t * chunk, n);
-        const hi = @min(lo + chunk, n);
-        if (hi > lo) f(ctx, lo, hi);
-    }
-    for (threads[0..spawned]) |t| t.join();
+    const t0 = nowNs();
+    g_pool.run(n, ctx, f);
+    profAdd(g_stage, nowNs() - t0);
 }
 
 // --------------------------------------------------------------------------- matmul
@@ -198,13 +344,13 @@ fn dotv(a: []const f32, b: []const f32) f32 {
         const x1: @Vector(8, f32) = @bitCast(a[i + 8 ..][0..8].*);
         const y0: @Vector(8, f32) = @bitCast(b[i..][0..8].*);
         const y1: @Vector(8, f32) = @bitCast(b[i + 8 ..][0..8].*);
-        a0 += x0 * y0;
-        a1 += x1 * y1;
+        a0 = @mulAdd(V, x0, y0, a0);
+        a1 = @mulAdd(V, x1, y1, a1);
     }
     while (i + 8 <= n) : (i += 8) {
         const x0: @Vector(8, f32) = @bitCast(a[i..][0..8].*);
         const y0: @Vector(8, f32) = @bitCast(b[i..][0..8].*);
-        a0 += x0 * y0;
+        a0 = @mulAdd(V, x0, y0, a0);
     }
     var s: f32 = 0;
     while (i < n) : (i += 1) s += a[i] * b[i];
@@ -250,8 +396,41 @@ fn selfTest(gpa: Allocator, w: *std.Io.Writer) !void {
         try w.print("  {d:>3}x{d:<5} x {d:>4}x{d:<5} {s:<18} max rel err {e:.2}\n", .{ s.rows, s.k, s.k, s.n, s.what, local_worst });
     }
     try w.print("\nworst relative error vs f64: {e:.3}\n", .{worst});
+
+    // The elementwise transcendentals run once per activation (millions of times a
+    // forward). expv is checked against the f64 library exp; geluv against the
+    // scalar gelu the decision head still uses -- same coefficients, different code
+    // path, so a vectorisation bug shows up here. Absolute truth for gelu comes from
+    // tools/refcheck.py, which evaluates math.erf in f64.
+    var worst_exp: f64 = 0;
+    var worst_gelu: f64 = 0;
+    {
+        var lane: [8]f32 = undefined;
+        var t: i32 = -8000;
+        while (t <= 8000) : (t += 1) {
+            const base: f32 = @as(f32, @floatFromInt(t)) * 0.001;
+            for (0..8) |l| lane[l] = base + @as(f32, @floatFromInt(l)) * 0.00017;
+            const ea: [8]f32 = @bitCast(expv(@bitCast(lane)));
+            const ga: [8]f32 = @bitCast(geluv(@bitCast(lane)));
+            for (0..8) |l| {
+                const x = lane[l];
+                const we = @exp(@as(f64, x));
+                worst_exp = @max(worst_exp, @abs(@as(f64, ea[l]) - we) / we);
+                const wg: f64 = gelu(x);
+                // |x|/sqrt2 > 5 drives erf to saturation, and there both this and the
+                // scalar path resolve a ~1e-7 cancellation against a true value of ~0,
+                // so the comparison floors at an absolute error of 5e-7.
+                const rel = @abs(@as(f64, ga[l]) - wg) / @max(0.05, @abs(wg));
+                worst_gelu = @max(worst_gelu, rel);
+            }
+        }
+    }
+    try w.print("expv  max rel err vs f64 exp {e:.2}\ngeluv max rel err vs scalar gelu {e:.2}\n", .{ worst_exp, worst_gelu });
+
     if (worst > 1e-4) {
         try w.print("FAIL: the GEMM kernel is wrong (expected < 1e-4)\n", .{});
+    } else if (worst_exp > 1e-6 or worst_gelu > 1e-5) {
+        try w.print("FAIL: the vector transcendentals are wrong\n", .{});
     } else {
         try w.print("PASS\n", .{});
     }
@@ -263,15 +442,155 @@ fn rowDot(out: []f32, x: []const f32, w: []const f32) void {
     for (0..out.len) |j| out[j] = dotv(x, w[j * x.len ..][0..x.len]);
 }
 
-/// out[i][j] = dot(x[i], w[j]) -- parallelised over output columns so that each
+const V = @Vector(8, f32);
+
+inline fn v8(a: []const f32, o: usize) V {
+    return @bitCast(a[o..][0..8].*);
+}
+
+/// The 8 lanes hold partial sums for 8 k-elements, so the block kernel reduces
+/// once per output instead of once per dot product.
+inline fn hsum(v: V) f32 {
+    return @reduce(.Add, v);
+}
+
+inline fn splatv(comptime k: f32) V {
+    return @splat(k);
+}
+
+/// Elementwise exp for 8 lanes. Range reduction is on the binary exponent, so the
+/// polynomial only has to cover |r| <= ln2/2 and 7th order is good to ~5e-9
+/// relative. `--selftest` checks both this and `geluv` against f64.
+inline fn expv(x: V) V {
+    const clamped = @max(@min(x, splatv(88.0)), splatv(-87.0));
+    const n = @round(clamped * splatv(1.4426950408889634));
+    const ni: @Vector(8, i32) = @intFromFloat(n);
+    const scale: V = @bitCast((ni + @as(@Vector(8, i32), @splat(127))) *%
+        @as(@Vector(8, i32), @splat(0x800000)));
+    const r = clamped - n * splatv(0.6931471805599453);
+    var p: V = splatv(1.0 / 5040.0);
+    p = @mulAdd(V, p, r, splatv(1.0 / 720.0));
+    p = @mulAdd(V, p, r, splatv(1.0 / 120.0));
+    p = @mulAdd(V, p, r, splatv(1.0 / 24.0));
+    p = @mulAdd(V, p, r, splatv(1.0 / 6.0));
+    p = @mulAdd(V, p, r, splatv(0.5));
+    p = @mulAdd(V, p, r, splatv(1.0));
+    p = @mulAdd(V, p, r, splatv(1.0));
+    return p * scale;
+}
+
+/// gelu over 8 lanes. Written as 0.5*(x + |x|*erf(|x|/sqrt2)) so the sign of x never
+/// has to be selected — that form is what the scalar `gelu` above evaluates to, and
+/// it collapses to the same value once erf saturates at 1.
+inline fn geluv(x: V) V {
+    const ax = @abs(x);
+    const a = ax * splatv(0.7071067811865476);
+    const t: V = splatv(1.0) / (splatv(1.0) + a * splatv(0.3275911));
+    var p: V = splatv(1.061405429);
+    p = @mulAdd(V, p, t, splatv(-1.453152027));
+    p = @mulAdd(V, p, t, splatv(1.421413741));
+    p = @mulAdd(V, p, t, splatv(-0.284496736));
+    p = @mulAdd(V, p, t, splatv(0.254829592));
+    const e = splatv(1.0) - (p * t) * expv(splatv(0.0) - a * a);
+    return splatv(0.5) * (x + ax * e);
+}
+
+/// out[*][j..j+4] against four weight rows at once, two tokens at a time.
+///
+/// The shape matters: with one weight row at a time (the old form, `dotv` per
+/// output) there are only two accumulator chains in flight, so the kernel waits
+/// on FMA latency instead of issuing. Four rows x two tokens = eight independent
+/// chains, which is what it takes to keep both FMA units busy, and each row's
+/// k-sweep stays a straight contiguous stream.
+fn block4(m: *const MM, j: usize) void {
+    const k = m.k;
+    const n = m.n;
+    const rows = m.rows;
+    const w0 = m.w[j * k ..];
+    const w1 = m.w[(j + 1) * k ..];
+    const w2 = m.w[(j + 2) * k ..];
+    const w3 = m.w[(j + 3) * k ..];
+
+    var i: usize = 0;
+    while (i < rows) : (i += 2) {
+        const step: usize = if (i + 1 < rows) 1 else 0;
+        const x0 = m.x[i * k ..];
+        const x1 = m.x[(i + step) * k ..];
+        const o0 = m.out[i * n ..];
+        const o1 = m.out[(i + step) * n ..];
+        const two = step == 1;
+
+        var a00: V = @splat(0);
+        var a01: V = @splat(0);
+        var a02: V = @splat(0);
+        var a03: V = @splat(0);
+        var a10: V = @splat(0);
+        var a11: V = @splat(0);
+        var a12: V = @splat(0);
+        var a13: V = @splat(0);
+
+        var t: usize = 0;
+        while (t + 8 <= k) : (t += 8) {
+            const p0 = v8(x0, t);
+            const p1 = v8(x1, t);
+            const y0 = v8(w0, t);
+            const y1 = v8(w1, t);
+            const y2 = v8(w2, t);
+            const y3 = v8(w3, t);
+            a00 = @mulAdd(V, p0, y0, a00);
+            a01 = @mulAdd(V, p1, y0, a01);
+            a02 = @mulAdd(V, p0, y1, a02);
+            a03 = @mulAdd(V, p1, y1, a03);
+            a10 = @mulAdd(V, p0, y2, a10);
+            a11 = @mulAdd(V, p1, y2, a11);
+            a12 = @mulAdd(V, p0, y3, a12);
+            a13 = @mulAdd(V, p1, y3, a13);
+        }
+        while (t < k) : (t += 1) {
+            a00[0] = @mulAdd(f32, x0[t], w0[t], a00[0]);
+            a01[0] = @mulAdd(f32, x1[t], w0[t], a01[0]);
+            a02[0] = @mulAdd(f32, x0[t], w1[t], a02[0]);
+            a03[0] = @mulAdd(f32, x1[t], w1[t], a03[0]);
+            a10[0] = @mulAdd(f32, x0[t], w2[t], a10[0]);
+            a11[0] = @mulAdd(f32, x1[t], w2[t], a11[0]);
+            a12[0] = @mulAdd(f32, x0[t], w3[t], a12[0]);
+            a13[0] = @mulAdd(f32, x1[t], w3[t], a13[0]);
+        }
+
+        o0[j + 0] = hsum(a00);
+        o0[j + 1] = hsum(a02);
+        o0[j + 2] = hsum(a10);
+        o0[j + 3] = hsum(a12);
+        if (two) {
+            o1[j + 0] = hsum(a01);
+            o1[j + 1] = hsum(a03);
+            o1[j + 2] = hsum(a11);
+            o1[j + 3] = hsum(a13);
+        }
+    }
+}
+
+/// out[i][j] = dot(x[i], w[j]) -- parallelised over 4-column blocks so that each
 /// weight row is streamed exactly once (this is the difference between ~2 s and
 /// ~200 ms per question: the other order re-reads the whole matrix per token).
-fn mmJob(ctx: *anyopaque, jlo: usize, jhi: usize) void {
+///
+/// The unit of work is a block, not a column: `parallel` splits whatever range it
+/// is given into chunks of an arbitrary size, and a chunk that starts or ends
+/// mid-block falls back to the per-column path below, which reads each weight row
+/// once per token instead of once per four columns.
+fn mmJob(ctx: *anyopaque, blo: usize, bhi: usize) void {
     const m: *MM = @ptrCast(@alignCast(ctx));
-    for (jlo..jhi) |j| {
-        const wrow = m.w[j * m.k ..][0..m.k];
-        for (0..m.rows) |i| {
-            m.out[i * m.n + j] = dotv(m.x[i * m.k ..][0..m.k], wrow);
+    var b = blo;
+    while (b < bhi) : (b += 1) {
+        const j = b * 4;
+        if (j + 4 <= m.n) {
+            block4(m, j);
+            continue;
+        }
+        var jj = j;
+        while (jj < m.n) : (jj += 1) {
+            const wrow = m.w[jj * m.k ..][0..m.k];
+            for (0..m.rows) |i| m.out[i * m.n + jj] = dotv(m.x[i * m.k ..][0..m.k], wrow);
         }
     }
 }
@@ -286,7 +605,7 @@ fn biasJob(ctx: *anyopaque, lo: usize, hi: usize) void {
 
 fn matmul(alloc: Allocator, out: []f32, x: []const f32, w: []const f32, rows: usize, n: usize, k: usize) void {
     var m = MM{ .out = out, .x = x, .w = w, .n = n, .k = k, .rows = rows };
-    parallel(alloc, n, &m, mmJob);
+    parallel(alloc, (n + 3) / 4, &m, mmJob);
 }
 
 fn linear(alloc: Allocator, out: []f32, x: []const f32, w: []const f32, bias: ?[]const f32, rows: usize, n: usize, k: usize) void {
@@ -315,6 +634,24 @@ fn f16at(raw: []const u8, i: usize) f32 {
     return @floatCast(@as(f16, @bitCast(u)));
 }
 
+const ConvJob = struct {
+    raw: []const u8,
+    out: []f32,
+};
+
+/// lo..hi are counted in groups of 8 elements. f16 -> f32 is exact, so this is a
+/// pure bandwidth operation; doing it a value at a time made the weight load
+/// (668 ms of the ~950 ms startup) cost more than a whole forward pass.
+fn convF16Job(ctx: *anyopaque, lo: usize, hi: usize) void {
+    const j: *ConvJob = @ptrCast(@alignCast(ctx));
+    var u = lo;
+    while (u < hi) : (u += 1) {
+        const o = u * 8;
+        const h: @Vector(8, f16) = @bitCast(j.raw[o * 2 ..][0..16].*);
+        j.out[o..][0..8].* = @as([8]f32, @bitCast(@as(V, @floatCast(h))));
+    }
+}
+
 fn toF32(alloc: Allocator, raw: []const u8, dtype: []const u8) ![]f32 {
     if (std.mem.eql(u8, dtype, "F32")) {
         const n = raw.len / 4;
@@ -325,7 +662,10 @@ fn toF32(alloc: Allocator, raw: []const u8, dtype: []const u8) ![]f32 {
     if (!std.mem.eql(u8, dtype, "F16")) return error.UnsupportedDtype;
     const n = raw.len / 2;
     const out = try alloc.alloc(f32, n);
-    for (0..n) |i| out[i] = f16at(raw, i);
+    var job = ConvJob{ .raw = raw, .out = out };
+    parallel(alloc, n / 8, &job, convF16Job);
+    var i = (n / 8) * 8;
+    while (i < n) : (i += 1) out[i] = f16at(raw, i);
     return out;
 }
 
@@ -947,38 +1287,42 @@ fn loadModel(alloc: Allocator, io: std.Io, dir: []const u8, cfg: *const Cfg) !st
     m.final_norm = try tensorF32(alloc, &infos, data, "encoder.final_norm.weight");
     m.type_emb = try tensorF32(alloc, &infos, data, "type_emb.weight");
 
+    // Two buffers, not one: `pre` must not point into the buffer being written, or
+    // bufPrint copies a slice onto itself -- harmless under ReleaseFast, but @memcpy
+    // asserts on overlap in Debug/Safe and panics at startup.
+    var pre: [24]u8 = undefined;
     var nm: [160]u8 = undefined;
     for (0..NL) |l| {
-        const pre = try std.fmt.bufPrint(&nm, "encoder.layers.{d}.", .{l});
+        const pfx = try std.fmt.bufPrint(&pre, "encoder.layers.{d}.", .{l});
         var an: ?[]const f32 = null;
-        if (l > 0) an = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn_norm.weight", .{pre}));
+        if (l > 0) an = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn_norm.weight", .{pfx}));
         m.layers[l] = .{
-            .wqkv = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wqkv.weight", .{pre})),
-            .wo = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wo.weight", .{pre})),
-            .wi = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wi.weight", .{pre})),
-            .wo2 = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wo.weight", .{pre})),
+            .wqkv = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wqkv.weight", .{pfx})),
+            .wo = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}attn.Wo.weight", .{pfx})),
+            .wi = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wi.weight", .{pfx})),
+            .wo2 = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp.Wo.weight", .{pfx})),
             .attn_norm = an,
-            .mlp_norm = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp_norm.weight", .{pre})),
+            .mlp_norm = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}mlp_norm.weight", .{pfx})),
             // config: layer_types[i] == "full_attention" iff i % global_attn_every_n_layers == 0 (3)
             .sliding = (l % 3) != 0,
         };
     }
 
     for (0..HEAD_LAYERS) |l| {
-        const pre = try std.fmt.bufPrint(&nm, "head.layers.{d}.", .{l});
+        const pfx = try std.fmt.bufPrint(&pre, "head.layers.{d}.", .{l});
         m.head[l] = .{
-            .norm1_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm1.weight", .{pre})),
-            .norm1_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm1.bias", .{pre})),
-            .norm2_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm2.weight", .{pre})),
-            .norm2_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm2.bias", .{pre})),
-            .in_proj_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.in_proj_weight", .{pre})),
-            .in_proj_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.in_proj_bias", .{pre})),
-            .out_proj_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.out_proj.weight", .{pre})),
-            .out_proj_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.out_proj.bias", .{pre})),
-            .lin1_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear1.weight", .{pre})),
-            .lin1_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear1.bias", .{pre})),
-            .lin2_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear2.weight", .{pre})),
-            .lin2_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear2.bias", .{pre})),
+            .norm1_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm1.weight", .{pfx})),
+            .norm1_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm1.bias", .{pfx})),
+            .norm2_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm2.weight", .{pfx})),
+            .norm2_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}norm2.bias", .{pfx})),
+            .in_proj_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.in_proj_weight", .{pfx})),
+            .in_proj_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.in_proj_bias", .{pfx})),
+            .out_proj_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.out_proj.weight", .{pfx})),
+            .out_proj_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}self_attn.out_proj.bias", .{pfx})),
+            .lin1_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear1.weight", .{pfx})),
+            .lin1_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear1.bias", .{pfx})),
+            .lin2_w = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear2.weight", .{pfx})),
+            .lin2_b = try tensorF32(alloc, &infos, data, try std.fmt.bufPrint(&nm, "{s}linear2.bias", .{pfx})),
         };
     }
 
@@ -1012,13 +1356,25 @@ const AttJob = struct {
     win: ?usize,
 };
 
+/// one head's score against one key: 64 MACs in 8 vector FMAs
+inline fn dot64(a: []const f32, ao: usize, b: []const f32, bo: usize) f32 {
+    var a0 = v8(a, ao) * v8(b, bo);
+    var a1 = v8(a, ao + 8) * v8(b, bo + 8);
+    var a2 = v8(a, ao + 16) * v8(b, bo + 16);
+    var a3 = v8(a, ao + 24) * v8(b, bo + 24);
+    a0 = @mulAdd(V, v8(a, ao + 32), v8(b, bo + 32), a0);
+    a1 = @mulAdd(V, v8(a, ao + 40), v8(b, bo + 40), a1);
+    a2 = @mulAdd(V, v8(a, ao + 48), v8(b, bo + 48), a2);
+    a3 = @mulAdd(V, v8(a, ao + 56), v8(b, bo + 56), a3);
+    return hsum((a0 + a1) + (a2 + a3));
+}
+
 fn attWorker(ctx: *anyopaque, lo: usize, hi: usize) void {
     const a: *AttJob = @ptrCast(@alignCast(ctx));
     const L = a.L;
     const scale: f32 = 1.0 / @sqrt(@as(f32, HD));
     for (lo..hi) |i| {
         const row = a.out[i * D ..][0..D];
-        @memset(row, 0);
         var klo: usize = 0;
         var khi: usize = L;
         var off: usize = 0;
@@ -1027,38 +1383,48 @@ fn attWorker(ctx: *anyopaque, lo: usize, hi: usize) void {
             khi = @min(L, i + w + 1);
             off = if (i >= w) 0 else w - i;
         }
+        const cnt = khi - klo;
         const rowp = a.att[i * a.stride + off ..];
         for (0..H) |h| {
             const qo = i * D + h * HD;
             var mx: f32 = -std.math.inf(f32);
             for (klo..khi) |j| {
-                const ko = j * D + h * HD;
-                var s: f32 = 0;
-                for (0..HD) |d| s += a.q[qo + d] * a.k[ko + d];
-                s *= scale;
+                const s = dot64(a.q, qo, a.k, j * D + h * HD) * scale;
                 rowp[j - klo] = s;
                 mx = @max(mx, s);
             }
-            var sum: f32 = 0;
-            const cnt = khi - klo;
-            for (0..cnt) |t| {
-                rowp[t] = @exp(rowp[t] - mx);
-                sum += rowp[t];
+            var sv_acc: V = splatv(0);
+            const mxv = @as(V, @splat(mx));
+            var tv: usize = 0;
+            while (tv + 8 <= cnt) : (tv += 8) {
+                const e = expv(v8(rowp, tv) - mxv);
+                rowp[tv..][0..8].* = @as([8]f32, @bitCast(e));
+                sv_acc += e;
             }
-            for (0..cnt) |t| rowp[t] /= sum;
+            var sum = hsum(sv_acc);
+            while (tv < cnt) : (tv += 1) {
+                const e = @exp(rowp[tv] - mx);
+                rowp[tv] = e;
+                sum += e;
+            }
+            const inv = 1.0 / sum;
+            // the head's 64 outputs stay in registers across the whole key range;
+            // accumulating through `row` instead turned every key into 8 loads
+            // and 8 stores. Normalising afterwards rather than per key takes the
+            // multiply out of the inner loop, and `sum >= 1` so dropping a weight
+            // below 1e-20 cannot change a single output bit.
+            var r: [HD / 8]V = undefined;
+            inline for (0..HD / 8) |c| r[c] = splatv(0);
             for (0..cnt) |t| {
                 const p = rowp[t];
-                if (p == 0) continue;
+                if (p < 1e-20) continue;
                 const vo = (klo + t) * D + h * HD;
-                const pv: @Vector(8, f32) = @splat(p);
-                const base = h * HD;
-                var c: usize = 0;
-                while (c < HD) : (c += 8) {
-                    var rv: @Vector(8, f32) = @bitCast(row[base + c ..][0..8].*);
-                    rv += pv * @as(@Vector(8, f32), @bitCast(a.v[vo + c ..][0..8].*));
-                    row[base + c ..][0..8].* = @as([8]f32, @bitCast(rv));
-                }
+                const pv: V = @splat(p);
+                inline for (0..HD / 8) |c| r[c] = @mulAdd(V, pv, v8(a.v, vo + c * 8), r[c]);
             }
+            const iv: V = @splat(inv);
+            const base = h * HD;
+            inline for (0..HD / 8) |c| row[base + c * 8 ..][0..8].* = @as([8]f32, @bitCast(r[c] * iv));
         }
     }
 }
@@ -1132,11 +1498,14 @@ fn normJob(ctx: *anyopaque, lo: usize, hi: usize) void {
 fn mlpJob(ctx: *anyopaque, lo: usize, hi: usize) void {
     const f: *FwdCtx = @ptrCast(@alignCast(ctx));
     for (lo..hi) |i| {
-        for (0..INTER) |j| {
-            const a = f.s.mlp[i * 2 * INTER + j];
-            const g = f.s.mlp[i * 2 * INTER + INTER + j];
-            f.s.mlp2[i * INTER + j] = gelu(a) * g;
+        const m = f.s.mlp[i * 2 * INTER ..];
+        const o = f.s.mlp2[i * INTER ..];
+        var j: usize = 0;
+        while (j + 8 <= INTER) : (j += 8) {
+            const g = geluv(v8(m, j)) * v8(m, j + INTER);
+            o[j..][0..8].* = @as([8]f32, @bitCast(g));
         }
+        while (j < INTER) : (j += 1) o[j] = gelu(m[j]) * m[j + INTER];
     }
 }
 
@@ -1188,13 +1557,26 @@ fn typeEmbJob(ctx: *anyopaque, lo: usize, hi: usize) void {
     }
 }
 
-fn splitQkv(q: []f32, k: []f32, v: []f32, qkv: []const f32, L: usize) void {
-    for (0..L) |i| {
-        const src = qkv[i * 2304 ..];
-        @memcpy(q[i * D ..][0..D], src[0..D]);
-        @memcpy(k[i * D ..][0..D], src[D .. 2 * D]);
-        @memcpy(v[i * D ..][0..D], src[2 * D .. 3 * D]);
+const SplitJob = struct {
+    q: []f32,
+    k: []f32,
+    v: []f32,
+    qkv: []const f32,
+};
+
+fn splitJob(ctx: *anyopaque, lo: usize, hi: usize) void {
+    const s: *SplitJob = @ptrCast(@alignCast(ctx));
+    for (lo..hi) |i| {
+        const src = s.qkv[i * 3 * D ..];
+        @memcpy(s.q[i * D ..][0..D], src[0..D]);
+        @memcpy(s.k[i * D ..][0..D], src[D .. 2 * D]);
+        @memcpy(s.v[i * D ..][0..D], src[2 * D .. 3 * D]);
     }
+}
+
+fn splitQkv(alloc: Allocator, q: []f32, k: []f32, v: []f32, qkv: []const f32, L: usize) void {
+    var job = SplitJob{ .q = q, .k = k, .v = v, .qkv = qkv };
+    parallel(alloc, L, &job, splitJob);
 }
 
 fn forward(alloc: Allocator, f: *FwdCtx) void {
@@ -1203,7 +1585,9 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
     const L = f.L;
 
     // ---- embeddings + norm (layer 0 has no attn_norm; embeddings.norm is folded in)
+    g_stage = ST_EMB;
     parallel(alloc, L, f, embedJob);
+    g_stage = ST_NORM;
     parallel(alloc, L, f, normJob);
     const dumping = g_dump_stats and g_fwd_count == 0;
     if (dumping) {
@@ -1214,15 +1598,20 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
     for (0..NL) |l| {
         const lay = &m.layers[l];
         var attn_in: []const f32 = s.x;
+        g_stage = ST_NORM;
         if (lay.attn_norm) |an| {
             normInto(alloc, s.x, s.xn, L, an, null);
             attn_in = s.xn;
         }
+        g_stage = ST_MATMUL;
         linear(alloc, s.qkv, attn_in, lay.wqkv, null, L, 3 * D, D);
-        splitQkv(s.q, s.k, s.v, s.qkv, L);
+        g_stage = ST_SPLIT;
+        splitQkv(alloc, s.q, s.k, s.v, s.qkv, L);
+        g_stage = ST_ROPE;
         ropeApply(alloc, s.q, L, &m.inv_freq);
         ropeApply(alloc, s.k, L, &m.inv_freq);
 
+        g_stage = ST_ATTN;
         var aj = AttJob{
             .q = s.q,
             .k = s.k,
@@ -1234,13 +1623,20 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
             .win = if (lay.sliding) WINDOW else null,
         };
         parallel(alloc, L, &aj, attWorker);
+        g_stage = ST_MATMUL;
         linear(alloc, s.xn, s.ctx, lay.wo, null, L, D, D);
+        g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
 
+        g_stage = ST_NORM;
         normInto(alloc, s.x, s.xn, L, lay.mlp_norm, null);
+        g_stage = ST_MATMUL;
         linear(alloc, s.mlp, s.xn, lay.wi, null, L, 2 * INTER, D);
+        g_stage = ST_GELU;
         parallel(alloc, L, f, mlpJob);
+        g_stage = ST_MATMUL;
         linear(alloc, s.xn, s.mlp2, lay.wo2, null, L, D, INTER);
+        g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
         if (dumping) {
             var tag: [8]u8 = undefined;
@@ -1249,6 +1645,7 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         }
     }
 
+    g_stage = ST_NORM;
     for (0..L) |i| layerNorm(s.x[i * D ..][0..D], m.final_norm, null);
     if (dumping) dumpStats("final", s.x, L);
     parallel(alloc, L, f, typeEmbJob);
@@ -1257,9 +1654,13 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
     // ---- decision head: 2 pre-norm transformer layers, bidirectional
     for (0..HEAD_LAYERS) |l| {
         const hl = &m.head[l];
+        g_stage = ST_NORM;
         normInto(alloc, s.x, s.xn, L, hl.norm1_w, hl.norm1_b);
+        g_stage = ST_MATMUL;
         linear(alloc, s.qkv, s.xn, hl.in_proj_w, hl.in_proj_b, L, 3 * D, D);
-        splitQkv(s.q, s.k, s.v, s.qkv, L);
+        g_stage = ST_SPLIT;
+        splitQkv(alloc, s.q, s.k, s.v, s.qkv, L);
+        g_stage = ST_ATTN;
         var aj = AttJob{
             .q = s.q,
             .k = s.k,
@@ -1271,13 +1672,20 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
             .win = null,
         };
         parallel(alloc, L, &aj, attWorker);
+        g_stage = ST_MATMUL;
         linear(alloc, s.xn, s.ctx, hl.out_proj_w, hl.out_proj_b, L, D, D);
+        g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
 
+        g_stage = ST_NORM;
         normInto(alloc, s.x, s.xn, L, hl.norm2_w, hl.norm2_b);
+        g_stage = ST_MATMUL;
         linear(alloc, s.ff, s.xn, hl.lin1_w, hl.lin1_b, L, HEAD_FF, D);
+        g_stage = ST_GELU;
         parallel(alloc, L, f, reluJob);
+        g_stage = ST_MATMUL;
         linear(alloc, s.xn, s.ff, hl.lin2_w, hl.lin2_b, L, D, HEAD_FF);
+        g_stage = ST_RES;
         parallel(alloc, L, f, addResJob);
         if (dumping) {
             var tag: [8]u8 = undefined;
@@ -1289,6 +1697,7 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
     @memcpy(f.pooled, s.x[0..D]);
 
     // ---- option markers -> scorer
+    const t_ser = if (g_prof) nowNs() else 0;
     const K = f.markers.len;
     for (0..K) |r| {
         var mvec: [D]f32 = undefined;
@@ -1344,6 +1753,7 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
     for (0..2) |i| a2[i] = rowDot1(&h256, m.act2_w[i * 256 ..][0..256]) + m.act2_b[i];
     softmax(&a2);
     f.act = a2;
+    if (g_prof) profAdd(ST_SERIAL, nowNs() - t_ser);
     g_fwd_count += 1;
 }
 
@@ -1607,6 +2017,7 @@ const ModelChooser = struct {
         try g.optionTexts(a, &opts);
 
         const sq = try buildSequence(a, self.tok, text, "choice", SNAKE_INS, &opts, self.cfg.max_len, self.cfg.head_max_len);
+        if (g_prof) profReset();
         const t0 = nowMs(io);
         var f = FwdCtx{
             .m = self.m,
@@ -1623,6 +2034,7 @@ const ModelChooser = struct {
         };
         forward(self.gpa, &f);
         self.ms = nowMs(io) - t0;
+        if (g_prof) try profReport(status);
 
         const k = @min(sq.markers.len, 4);
         const temp = @max(1e-3, self.m.temperature[0]);
@@ -1883,6 +2295,10 @@ fn tokCheck(gpa: Allocator, io: std.Io, tok: *const Tokenizer, path: []const u8)
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag == .windows) _ = SetConsoleOutputCP(65001);
+    if (builtin.os.tag == .windows) {
+        var fr: i64 = 0;
+        if (QueryPerformanceFrequency(&fr) != 0 and fr > 0) g_qpc_freq = fr;
+    }
 
     const gpa = std.heap.page_allocator;
     const io = init.io;
@@ -1929,6 +2345,10 @@ pub fn main(init: std.process.Init) !void {
             g_dump_stats = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--profile")) {
+            g_prof = true;
+            continue;
+        }
         const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or
             std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--tokcheck") or
             std.mem.eql(u8, a, "--size") or std.mem.eql(u8, a, "--games") or
@@ -1942,7 +2362,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, key, "--dir")) dir = v;
         if (std.mem.eql(u8, key, "--json")) json_path = v;
         if (std.mem.eql(u8, key, "--tokcheck")) tokcheck = v;
-        if (std.mem.eql(u8, key, "--threads")) g_threads = std.fmt.parseInt(usize, v, 10) catch 4;
+        if (std.mem.eql(u8, key, "--threads")) g_threads = std.fmt.parseInt(usize, v, 10) catch 0;
         if (std.mem.eql(u8, key, "--size")) s_opts.size = @max(6, @min(std.fmt.parseInt(usize, v, 10) catch 10, 24));
         if (std.mem.eql(u8, key, "--games")) s_opts.games = @max(1, std.fmt.parseInt(usize, v, 10) catch 1);
         if (std.mem.eql(u8, key, "--delay")) s_opts.delay_ms = std.fmt.parseInt(i64, v, 10) catch 0;
@@ -1958,11 +2378,15 @@ pub fn main(init: std.process.Init) !void {
                 .model;
         }
     }
-    g_threads = @max(1, @min(g_threads, 64));
-    if (g_threads == 4) {
-        // measured: past ~8 threads the matmul is memory-latency bound and gets slower
-        if (std.Thread.getCpuCount()) |n| g_threads = @max(1, @min(n, 8)) else |_| {}
+    if (g_threads == 0) {
+        // Measured here (4 P-cores + 8 E-cores, 16 logical): a ~340-token Snake
+        // decision takes 296 ms at 8 threads, 253 ms at 12, 412 ms at 16 -- the
+        // barrier waits for the slowest straggler once every logical CPU is busy.
+        if (std.Thread.getCpuCount()) |n| g_threads = @max(1, @min(n, 12)) else |_| {
+            g_threads = 4;
+        }
     }
+    g_threads = @max(1, @min(g_threads, 64));
 
     var out_buf: [1 << 16]u8 = undefined;
     var fw = std.Io.File.stdout().writer(io, &out_buf);
@@ -1975,6 +2399,9 @@ pub fn main(init: std.process.Init) !void {
         try selfTest(gpa, w);
         return;
     }
+
+    g_pool.start(gpa, g_threads);
+    defer g_pool.stopAll();
 
     // ---- config
     var cfg = Cfg{};
@@ -2117,6 +2544,7 @@ pub fn main(init: std.process.Init) !void {
     const logits = try gpa.alloc(f32, Kmax);
 
     // ---- forward, one question per pass
+    profReset();
     for (questions, 0..) |q, qi| {
         const sq = seqs[qi];
         var f = FwdCtx{
@@ -2175,6 +2603,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const t3 = nowMs(io);
+    try profReport(w);
     try w.print("\nforward {d} ms | total {d} ms\n", .{ t3 - t2, t3 - t0 });
     try w.flush();
 }
