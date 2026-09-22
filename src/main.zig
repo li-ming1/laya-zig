@@ -22,9 +22,9 @@
 //!
 //! snake:  --snake                let the model play Snake (one game, animated board)
 //!         --snake --games 10     summary over N games, no animation
-//!         --snake --policy greedy|random   baselines to compare against
+//!         --snake --policy greedy|random|tiers|cycle  baselines to compare against
 //!         --snake --prompt       print the board text the model is given
-//!         --snake --promptv 0..7  how the position is phrased (ladder in snake.zig)
+//!         --snake --promptv 0..9  how the position is phrased (ladder in snake.zig)
 //!         --size N --max-steps N --delay MS --seed N
 //!
 //! Validated against an independent pure-Python reference implementation
@@ -2096,7 +2096,7 @@ fn confidenceFromProbs(p: []const f32, k: usize) f32 {
 
 const snake = @import("snake.zig");
 
-const Policy = enum { model, greedy, random };
+const Policy = enum { model, greedy, random, tiers, cycle };
 
 const SNAKE_INS = "Which move keeps the snake alive and reaches the food?";
 
@@ -2189,15 +2189,22 @@ const ModelChooser = struct {
         // than a preference to be learned: the model then ranks only the moves
         // that are still legal. `--promptv 7` also drops the moves that step
         // away from the food, leaving the model to break the tie between the
-        // survivors that close the distance. Without this the reported
-        // probabilities are the model's own, fatal ones included.
+        // survivors that close the distance. `--promptv 8` replaces that single
+        // distance rule with the tiered one in snake.zig, where a move only
+        // counts if the snake can still reach the food afterwards. Without a
+        // mask the reported probabilities are the model's own, fatal ones
+        // included.
         if (snake.prompt_variant >= 6) {
+            var allowed: [4]bool = .{ true, true, true, true };
+            if (snake.prompt_variant == 8) allowed = g.rankedMoves();
+            if (snake.prompt_variant == 9) allowed = g.cycleMoves();
             var left: f32 = 0;
             for (0..k) |r| {
-                const keep = if (snake.prompt_variant == 7)
-                    g.moveIsBest(snake.DIRS[r])
-                else
-                    !g.moveIsFatal(snake.DIRS[r]);
+                const keep = switch (snake.prompt_variant) {
+                    8, 9 => allowed[r],
+                    7 => g.moveIsBest(snake.DIRS[r]),
+                    else => !g.moveIsFatal(snake.DIRS[r]),
+                };
                 if (keep) {
                     left += p[r];
                 } else {
@@ -2244,6 +2251,8 @@ const WebSession = struct {
     last: ?LastMove = null,
     fatal: [4]bool = .{ false, false, false, false },
     prompt: AList(u8),
+    /// which rung of the prompt ladder the page is playing (`?v=` on /api/new)
+    variant: u8 = 0,
 
     const LastMove = struct {
         dir: snake.Dir,
@@ -2274,9 +2283,15 @@ const WebSession = struct {
         defer self.gpa.free(txt);
         try self.prompt.appendSlice(txt);
         const h = g.head();
+        const tail = g.tailCell();
         for (snake.DIRS, 0..) |d, i| {
-            const nb = g.neighbour(h, d);
-            self.fatal[i] = nb == null or g.occupied[nb.?[0] * g.size + nb.?[1]];
+            self.fatal[i] = if (g.neighbour(h, d)) |nb|
+                // The tail vacates on this very move, so stepping onto it is how
+                // a snake that fills the board finishes; only leaving the board
+                // or entering the rest of the body is fatal.
+                g.occupied[nb[0] * g.size + nb[1]] and !(nb[0] == tail[0] and nb[1] == tail[1])
+            else
+                true;
         }
     }
 
@@ -2289,7 +2304,7 @@ const WebSession = struct {
                 self.last = self.mc.last;
                 return d;
             },
-            .greedy, .random => {
+            .greedy, .random, .tiers, .cycle => {
                 const d = try self.base.moveFn(self.base.ctx, io, g, status);
                 // baselines are deterministic about the direction they pick
                 var p: [4]f32 = .{ 0, 0, 0, 0 };
@@ -2308,7 +2323,7 @@ const WebSession = struct {
             g.steps,
             if (g.alive) "true" else "false",
             g.illegal,
-            if (g.alive) "" else if (g.hit_wall) "wall" else "self",
+            if (g.alive) "" else if (g.won) "won" else if (g.hit_wall) "wall" else "self",
             g.dir.label(),
             g.food[0],
             g.food[1],
@@ -2349,19 +2364,34 @@ fn webHandle(ctx: *anyopaque, io: std.Io, req: server.Request, out: *std.Io.Writ
         const size: usize = @intCast(@max(6, @min(req.intParam("size", 10), 24)));
         const seed: u64 = @intCast(@max(0, req.intParam("seed", 12345)));
         const pol = req.param("policy") orelse "model";
+        // The prompt ladder is a global the chooser reads, so it belongs to the
+        // session: the page asks for one rung per game and every later request
+        // puts it back, whatever the last request left behind.
+        self.variant = @intCast(@max(0, @min(req.intParam("v", @as(i64, @intCast(snake.prompt_variant))), 9)));
+        snake.prompt_variant = self.variant;
         self.policy = if (std.mem.eql(u8, pol, "greedy"))
             .greedy
         else if (std.mem.eql(u8, pol, "random"))
             .random
+        else if (std.mem.eql(u8, pol, "tiers"))
+            .tiers
+        else if (std.mem.eql(u8, pol, "cycle"))
+            .cycle
         else
             .model;
-        self.base = if (self.policy == .random) snake.randomChooser() else snake.greedyChooser();
+        self.base = switch (self.policy) {
+            .random => snake.randomChooser(),
+            .tiers => snake.tierChooser(),
+            .cycle => snake.cycleChooser(),
+            else => snake.greedyChooser(),
+        };
         try self.newGame(size, seed);
         try self.writeState(out, true);
         return .{};
     }
 
     if (std.mem.eql(u8, req.path, "/api/step")) {
+        snake.prompt_variant = self.variant;
         if (self.game.alive) {
             var scratch: std.Io.Writer.Allocating = .init(self.gpa);
             defer scratch.deinit();
@@ -2489,6 +2519,7 @@ pub fn main(init: std.process.Init) !void {
     var s_policy: Policy = .model;
     var s_opts = snake.Config{};
     var snake_prompt_v: u8 = 0;
+    var s_steps_set = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -2543,13 +2574,20 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, key, "--games")) s_opts.games = @max(1, std.fmt.parseInt(usize, v, 10) catch 1);
         if (std.mem.eql(u8, key, "--delay")) s_opts.delay_ms = std.fmt.parseInt(i64, v, 10) catch 0;
         if (std.mem.eql(u8, key, "--seed")) s_opts.seed = std.fmt.parseInt(u64, v, 10) catch 12345;
-        if (std.mem.eql(u8, key, "--max-steps")) s_opts.max_steps = @max(1, std.fmt.parseInt(usize, v, 10) catch 400);
+        if (std.mem.eql(u8, key, "--max-steps")) {
+            s_opts.max_steps = std.fmt.parseInt(usize, v, 10) catch 0;
+            s_steps_set = s_opts.max_steps > 0;
+        }
         if (std.mem.eql(u8, key, "--port")) port = std.fmt.parseInt(u16, v, 10) catch 8080;
         if (std.mem.eql(u8, key, "--policy")) {
             s_policy = if (std.mem.eql(u8, v, "greedy"))
                 .greedy
             else if (std.mem.eql(u8, v, "random"))
                 .random
+            else if (std.mem.eql(u8, v, "tiers"))
+                .tiers
+            else if (std.mem.eql(u8, v, "cycle"))
+                .cycle
             else
                 .model;
         }
@@ -2564,7 +2602,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     g_threads = @max(1, @min(g_threads, 64));
-    snake.prompt_variant = @min(snake_prompt_v, 7);
+    snake.prompt_variant = @min(snake_prompt_v, 9);
+    if (!s_steps_set) s_opts.max_steps = snake.defaultMaxSteps(s_opts.size);
 
     var out_buf: [1 << 16]u8 = undefined;
     var fw = std.Io.File.stdout().writer(io, &out_buf);
@@ -2655,11 +2694,15 @@ pub fn main(init: std.process.Init) !void {
             .model => .{ .ctx = &mc, .moveFn = ModelChooser.moveFn },
             .greedy => snake.greedyChooser(),
             .random => snake.randomChooser(),
+            .tiers => snake.tierChooser(),
+            .cycle => snake.cycleChooser(),
         };
         const name = switch (s_policy) {
             .model => "model",
             .greedy => "greedy (baseline)",
             .random => "random (baseline)",
+            .tiers => "tiered rules, no model (baseline)",
+            .cycle => "cycle + shortcuts, no model (baseline)",
         };
         try snake.run(gpa, io, w, chooser, name, s_opts, s_policy == .model and enableAnsi());
         return;

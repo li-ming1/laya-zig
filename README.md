@@ -212,9 +212,10 @@ byte-identical input to upstream.
 | `--serve [--port N]` | local browser UI (default 8080) |
 | `--snake` | let the model play Snake, one frame per move |
 | `--snake --games N` | N games, summary only |
-| `--snake --policy greedy\|random` | swap in a baseline for comparison |
+| `--snake --policy greedy\|random\|tiers\|cycle` | swap in a baseline for comparison |
 | `--snake --prompt` | print the board text handed to the model |
-| `--size N --seed N --max-steps N --delay MS` | Snake options (default 10 / 12345 / 400 / 0) |
+| `--snake --promptv 0..9` | how much of the move the board decides instead of the model (`9` = Hamiltonian cycle: it fills the board whatever the model answers) |
+| `--size N --seed N --max-steps N --delay MS` | Snake options (default 10 / 12345 / `N^4 / 2` / 0) |
 | `--selftest` | SIMD kernels vs f64 |
 | `--profile` | print where each forward spends its time, by stage |
 | `--dumpstats` | per-layer hidden-state fingerprints, for `tools/refcheck.py` |
@@ -306,6 +307,41 @@ spinning until a step cap.
 The UI quantifies all of it: what fraction of moves picked a direction that ends
 the game immediately, how many of those were made with confidence > 0.5, mean
 confidence, cycle length and repeat count, and the three-way comparison table.
+
+### Making it finish
+
+Everything above is what happens when the model is asked to hold the whole
+problem. `--promptv 0..9` walks the other way: each rung lets the board decide
+more and hands the model less. Rung 9 hands over the most -- a Hamiltonian cycle
+over every cell of the board, which exists whenever the board has an even number
+of rows. It offers the single next step along that cycle, plus the shortcuts that
+cannot overtake the tail, and nothing else:
+
+| board | chooser | result | moves to fill |
+|---|---|---|---|
+| 8x8 | `--policy cycle` | 10/10 board full | 877–1046 |
+| 10x10 | `--policy cycle` | 10/10 board full | 1929–2629 |
+| 16x16 | `--policy cycle` | 5/5 board full | 15262–16056 |
+| 8x8 | model, `--promptv 9` | 4/4 board full | 722–853 |
+| 10x10 | model, `--promptv 9` | 2/2 board full | 1997–2055 |
+
+Every move in that set is safe by construction, so the board fills whichever one
+is answered and the model is left choosing which way round to go. That is the
+board's guarantee and not something the model learned -- with `--promptv 0` the
+same weights go straight back to scoring zero -- so past this point the score
+stops being the interesting number and the *move count* becomes it. On 8x8 the
+model needed 722–853 moves against the cycle baseline's 877–1046, and on 10x10
+1997–2055 against 1929–2629: the options it happens to prefer are mostly
+shortcuts, which is luck rather than skill, but it is what the loop looks like
+when the outcome it decides between no longer includes dying.
+
+Filling a board takes thousands of moves, not hundreds, which is why
+`--max-steps` now follows the board (`size^4 / 2`) instead of defaulting to 400:
+at 400 every tiered variant stopped with the picture still mostly empty, which
+reads as "it cannot finish" when it was simply not given the moves. `--policy
+cycle` is the same tier with no model in the loop and finishes a full 16x16 in
+well under a second, which is the honest price of the forward pass: the model pays
+minutes for what rules pay milliseconds.
 
 ## Limitations
 

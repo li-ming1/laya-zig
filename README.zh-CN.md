@@ -184,9 +184,10 @@ zig-out/bin/laya.exe --serve --port 8080   # 本地网页界面
 | `--serve [--port N]` | 起本地网页界面（默认 8080） |
 | `--snake` | 让模型玩贪吃蛇，逐帧渲染 |
 | `--snake --games N` | N 局汇总，不逐帧渲染 |
-| `--snake --policy greedy\|random` | 换成基线策略做对照 |
+| `--snake --policy greedy\|random\|tiers\|cycle` | 换成基线策略做对照 |
 | `--snake --prompt` | 打印喂给模型的盘面文本 |
-| `--size N --seed N --max-steps N --delay MS` | 蛇的参数（默认 10 / 12345 / 400 / 0） |
+| `--snake --promptv 0..9` | 让棋盘替模型回答多少（第 9 档给出哈密顿环，模型怎么答都会走满棋盘） |
+| `--size N --seed N --max-steps N --delay MS` | 蛇的参数（默认 10 / 12345 / `N^4 / 2` / 0） |
 | `--selftest` | SIMD 内核与 f64 对照 |
 | `--profile` | 打印每次前向在各阶段上的耗时分布 |
 | `--dumpstats` | 打印逐层隐状态指纹，给 `tools/refcheck.py` 用 |
