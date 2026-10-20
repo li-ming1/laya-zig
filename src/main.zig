@@ -299,6 +299,13 @@ const Pool = struct {
 
     fn stopAll(self: *Pool) void {
         self.stop.store(true, .release);
+        // A worker can pass its `stop` check and enter `park` in the window
+        // between that store and the wake below. It would then wait on `gen`,
+        // which no longer changes, and the join would never return -- a lost
+        // wakeup that showed up as a process which finished its work (0.9 s of
+        // CPU) and never exited. Bumping `gen` makes the value comparison inside
+        // the wait fail, so a worker that arrives late does not sleep.
+        _ = self.gen.fetchAdd(1, .release);
         std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
         for (self.threads.items) |t| t.join();
         self.threads.deinit();
