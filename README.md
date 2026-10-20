@@ -111,6 +111,9 @@ So a one-shot decision is now ~90 ms all in — 2–3 ms tokenizer, ~4 ms weight
 80–85 ms forward — and the tables never touch private memory: they are pages of
 a mapped file, evictable like the weights. `--profile` splits the one-time build:
 ~20 ms vocab, ~50 ms scanning 17 MB, ~50 ms hashing and inserting 840k keys.
+Every run ends by printing its own wall time, peak memory and CPU seconds
+(`cpu 1.09 s` for that question), so cost can be read off a single invocation
+instead of sampled from outside.
 
 Neither column trades accuracy for speed — both print bit-identical probabilities
 and choices. `--selftest` puts the worst GEMM relative error at 7.98e-6 against
@@ -137,6 +140,12 @@ Twelve threads is ~10 % quicker on the two-question demo and no quicker on a
 Snake decision, for 30–60 % more CPU-seconds. Sixteen — one per logical CPU,
 which sounds like the obvious guess — is slower *and* three times the CPU: the
 barrier waits for the slowest SMT straggler.
+
+A 2026-10-20 rerun of `--benchgemm` under ten CPU affinity masks says the same
+thing from the other side: every 8-CPU mask lands between 222 and 256 GFLOPS
+(whether the mask is the low half, the high half, one per core, or all 16) and
+every 4-CPU mask between 74 and 89. Thread *count* is the knob; thread *placement*
+is not.
 
 For reference, the upstream implementation needs ~33 ms per question on a T4.
 This is what a plain CPU costs with zero dependencies.

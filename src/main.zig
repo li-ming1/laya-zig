@@ -751,6 +751,22 @@ fn peakMem() ?MemCounters {
     return pmc;
 }
 
+const Filetime = extern struct { low: u32, high: u32 };
+extern "kernel32" fn GetProcessTimes(h: ?*anyopaque, creation: *Filetime, exit: *Filetime, kernel: *Filetime, user: *Filetime) callconv(.winapi) i32;
+
+/// CPU seconds this process has burned so far (kernel + user), so a run can be
+/// compared on cost as well as on wall time -- the pool's workers spin at every
+/// barrier, and that shows up here and nowhere else.
+fn cpuSeconds() ?f64 {
+    var c: Filetime = undefined;
+    var e: Filetime = undefined;
+    var k: Filetime = undefined;
+    var u: Filetime = undefined;
+    if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) == 0) return null;
+    const ticks: u64 = (@as(u64, k.high) << 32 | k.low) + (@as(u64, u.high) << 32 | u.low);
+    return @as(f64, @floatFromInt(ticks)) / 1e7;
+}
+
 /// `--benchgemm`: the linear16 kernel on the model's real shapes, without the
 /// model. Reports GFLOPS per shape so a kernel change can be judged in seconds
 /// instead of by a noisy whole-forward A/B.
@@ -3340,6 +3356,9 @@ pub fn main(init: std.process.Init) !void {
     try w.print("\nforward {d} ms | total {d} ms", .{ t3 - t2, t3 - t0 });
     if (peakMem()) |pmc| {
         try w.print(" | peak {d} MB working set, {d} MB commit", .{ pmc.PeakWorkingSetSize / (1024 * 1024), pmc.PeakPagefileUsage / (1024 * 1024) });
+    }
+    if (cpuSeconds()) |cs| {
+        try w.print(" | cpu {d:.2} s", .{cs});
     }
     try w.print("\n", .{});
     try w.flush();
