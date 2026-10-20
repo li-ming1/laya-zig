@@ -8,7 +8,8 @@
 > to a working port. It runs end to end and the forward pass is checked against an
 > independent reference implementation, and it has had two serious performance
 > passes (see *Measured* — a Snake decision costs ~170 ms on a laptop CPU, in
-> ~330 MB of memory), but treat it as a **half-finished project**: expect rough
+> ~320 MB of working set and 84 MB of private commit), but treat it as a
+> **half-finished project**: expect rough
 > edges and missing features. It has not been used in anything real.
 >
 > Issues, corrections and pull requests are welcome.
@@ -91,6 +92,15 @@ Private bytes are the part the OS cannot take back; the rest is the weight file,
 mapped read-only, so it is just the system file cache and is evictable — which is
 why the idle server drops to 81 MB and why it can never be 614 MB again on a box
 that is short of memory.
+
+A later pass (2026-10-20) took the tokenizer's copies out of the picture:
+`tokenizer.json` is mapped instead of read, the vocab keys point straight into
+the mapping, and the 580k merge keys are carved from a flat pool instead of one
+`allocPrint` each. Idle `--serve` private bytes fell from 222 MB to 139 MB, and
+every run now reports its own peak: **84 MB of commit** for a one-question run,
+85 MB for the demo. Latency barely moved — the load is ~110 ms either way, and
+`--profile` splits it into ~20 ms vocab, ~50 ms scanning 17 MB and ~50 ms
+hashing and inserting 840k keys — so this one buys memory, not speed.
 
 Neither column trades accuracy for speed — both print bit-identical probabilities
 and choices. `--selftest` puts the worst GEMM relative error at 7.98e-6 against
@@ -217,6 +227,8 @@ byte-identical input to upstream.
 | `--snake --promptv 0..9` | how much of the move the board decides instead of the model (`9` = Hamiltonian cycle: it fills the board whatever the model answers) |
 | `--size N --seed N --max-steps N --delay MS` | Snake options (default 10 / 12345 / `N^4 / 2` / 0) |
 | `--selftest` | SIMD kernels vs f64 |
+| `--benchgemm` | time the GEMM kernel on this model's shapes, no weights needed |
+| `--pretouch` | fault the mapped weight pages in before answering — wins when the file is not in the OS cache, costs ~60 ms when it is |
 | `--profile` | print where each forward spends its time, by stage |
 | `--dumpstats` | per-layer hidden-state fingerprints, for `tools/refcheck.py` |
 | `--tokcheck FILE` | validate the tokenizer against golden samples |

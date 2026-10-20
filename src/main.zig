@@ -102,6 +102,7 @@ var g_debug: bool = false;
 /// hidden state, so a reference implementation can be diffed against this one
 /// layer by layer (see tools/refcheck.py). Only the first forward pass dumps.
 var g_dump_stats: bool = false;
+var g_pretouch: bool = false;
 var g_fwd_count: usize = 0;
 
 /// Kept to short lines on purpose: tools/refcheck.py reads this after PowerShell
@@ -726,6 +727,82 @@ fn rowDot1(a: []const f32, b: []const f32) f32 {
     return o[0];
 }
 
+/// Peak memory of this process, so a run reports its own cost instead of
+/// depending on an external sampler that may miss a 200 ms process entirely.
+const MemCounters = extern struct {
+    cb: u32 = @sizeOf(MemCounters),
+    PageFaultCount: u32 = 0,
+    PeakWorkingSetSize: usize = 0,
+    WorkingSetSize: usize = 0,
+    QuotaPeakPagedPoolUsage: usize = 0,
+    QuotaPagedPoolUsage: usize = 0,
+    QuotaPeakNonPagedPoolUsage: usize = 0,
+    QuotaNonPagedPoolUsage: usize = 0,
+    PagefileUsage: usize = 0,
+    PeakPagefileUsage: usize = 0,
+};
+
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn K32GetProcessMemoryInfo(h: ?*anyopaque, pmc: *MemCounters, cb: u32) callconv(.winapi) i32;
+
+fn peakMem() ?MemCounters {
+    var pmc = MemCounters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, @sizeOf(MemCounters)) == 0) return null;
+    return pmc;
+}
+
+/// `--benchgemm`: the linear16 kernel on the model's real shapes, without the
+/// model. Reports GFLOPS per shape so a kernel change can be judged in seconds
+/// instead of by a noisy whole-forward A/B.
+fn benchGemm(gpa: Allocator, w: *std.Io.Writer) !void {
+    const Shape = struct { rows: usize, n: usize, k: usize, name: []const u8 };
+    const shapes = [_]Shape{
+        .{ .rows = 63, .n = 3 * D, .k = D, .name = "qkv 63" },
+        .{ .rows = 63, .n = D, .k = D, .name = "attn-out 63" },
+        .{ .rows = 63, .n = 2 * INTER, .k = D, .name = "mlp-in 63" },
+        .{ .rows = 63, .n = D, .k = INTER, .name = "mlp-out 63" },
+        .{ .rows = 63, .n = HEAD_FF, .k = D, .name = "head-ff1 63" },
+        .{ .rows = 175, .n = 3 * D, .k = D, .name = "qkv 175" },
+        .{ .rows = 175, .n = 2 * INTER, .k = D, .name = "mlp-in 175" },
+    };
+    try w.print("gemm benchmark, {d} threads\n", .{g_threads});
+    var all_flops: f64 = 0;
+    var all_ns: i64 = 0;
+    for (shapes) |s| {
+        const x = try gpa.alloc(f32, s.rows * s.k);
+        defer gpa.free(x);
+        const wm = try gpa.alloc(f16, s.n * s.k);
+        defer gpa.free(wm);
+        const out = try gpa.alloc(f32, s.rows * s.n);
+        defer gpa.free(out);
+        for (x, 0..) |*v, idx| v.* = @as(f32, @floatFromInt(idx % 17)) * 0.01 - 0.08;
+        for (wm, 0..) |*v, idx| v.* = @floatFromInt(@as(i32, @intCast(idx % 13)) - 6);
+        const shape_flops: f64 = 2.0 * @as(f64, @floatFromInt(s.rows * s.n * s.k));
+        // ~150 ms of work per shape, at least 3 reps: long enough that the
+        // measurement is sustained clocks rather than a turbo spike
+        const reps: usize = @max(3, @as(usize, @intFromFloat(150e6 / shape_flops)));
+        linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+        var best: i64 = std.math.maxInt(i64);
+        var sum: i64 = 0;
+        const rounds: usize = 3;
+        for (0..rounds) |_| {
+            const t0 = nowNs();
+            for (0..reps) |_| linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+            const dt = nowNs() - t0;
+            best = @min(best, dt);
+            sum += dt;
+        }
+        const flops = shape_flops * @as(f64, @floatFromInt(reps));
+        const gf_best = flops / @as(f64, @floatFromInt(best));
+        const gf_med = flops * @as(f64, @floatFromInt(rounds)) / @as(f64, @floatFromInt(sum));
+        try w.print("  {s:<14} {d:>4}x{d:<5} x {d:>4}x{d:<5} {d:>6.1} GFLOPS best, {d:>6.1} median\n", .{ s.name, s.rows, s.k, s.k, s.n, gf_best, gf_med });
+        all_flops += flops * @as(f64, @floatFromInt(rounds));
+        all_ns += sum;
+    }
+    try w.print("  aggregate {d:.1} GFLOPS\n", .{all_flops / @as(f64, @floatFromInt(all_ns))});
+    try w.flush();
+}
+
 // --------------------------------------------------------------------------- safetensors
 const TensorInfo = struct {
     dtype: []const u8,
@@ -742,6 +819,29 @@ const ConvJob = struct {
     raw: []const u8,
     out: []f32,
 };
+
+/// One read per 4 KB page of the mapped weights, spread over the workers. The
+/// pages are cold in this process until something touches them, and the first
+/// forward would otherwise take that cost -- single-threaded, inside the GEMM
+/// inner loop. Doing it up front on all cores turns ~60k serial faults into a
+/// short parallel pass.
+const TouchJob = struct { mem: []const u8, pages: usize };
+
+fn touchJob(ctx: *anyopaque, lo: usize, hi: usize) void {
+    const j: *const TouchJob = @ptrCast(@alignCast(ctx));
+    const base = @intFromPtr(j.mem.ptr);
+    var p = lo;
+    while (p < hi) : (p += 1) {
+        const off = p * 4096;
+        if (off >= j.mem.len) return;
+        _ = @as(*const volatile u8, @ptrFromInt(base + off)).*;
+    }
+}
+
+fn pretouch(alloc: Allocator, mem: []const u8) void {
+    var job = TouchJob{ .mem = mem, .pages = (mem.len + 4095) / 4096 };
+    parallel(alloc, job.pages, &job, touchJob);
+}
 
 /// lo..hi are counted in groups of 8 elements. f16 -> f32 is exact, so this is a
 /// pure bandwidth operation; doing it a value at a time made the weight load
@@ -946,6 +1046,24 @@ const JScan = struct {
         }
         return buf[0..o];
     }
+    /// The string at the cursor, without copying or decoding it when it holds no
+    /// escape sequences -- which is true of all but a few hundred of the 256k
+    /// vocab keys, and of every merge half. The slice then points into the source
+    /// buffer, so `loadTokenizer` has to keep the file mapping alive; escaped keys
+    /// take the slow path and land in `buf` as before.
+    fn stringLinked(self: *JScan, buf: []u8) ![]const u8 {
+        self.ws();
+        const start = self.i;
+        try self.expect('"');
+        const rest = self.s[self.i..];
+        const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.TruncatedJson;
+        if (std.mem.indexOfScalar(u8, rest[0..q], '\\') == null) {
+            self.i += q + 1;
+            return rest[0..q];
+        }
+        self.i = start;
+        return try self.stringInto(buf);
+    }
     fn uint(self: *JScan) !u32 {
         self.ws();
         var v: u32 = 0;
@@ -993,6 +1111,34 @@ fn encodeUtf8(cp: u32, buf: []u8, o: usize) !usize {
 const TokSink = struct {
     tok: *Tokenizer,
     alloc: Allocator,
+    pool: KeyPool = .{ .alloc = undefined },
+    t_vocab: i64 = 0,
+    t_merges: i64 = 0,
+    t_added: i64 = 0,
+};
+
+/// Composite merge keys (`a` NUL `b`), carved out of 1 MB blocks that are never
+/// freed (the tokenizer arena owns them) so that the slices handed to the hash
+/// map never move. 580k merges used to be 580k `allocPrint` calls, and the format
+/// machinery alone was most of the tokenizer's load time.
+const KeyPool = struct {
+    alloc: Allocator,
+    cur: []u8 = &.{},
+    used: usize = 0,
+
+    fn key(self: *KeyPool, a: []const u8, b: []const u8) ![]const u8 {
+        const n = a.len + 1 + b.len;
+        if (self.used + n > self.cur.len) {
+            self.cur = try self.alloc.alloc(u8, @max(n, 1 << 20));
+            self.used = 0;
+        }
+        const out = self.cur[self.used..][0..n];
+        @memcpy(out[0..a.len], a);
+        out[a.len] = 0;
+        @memcpy(out[a.len + 1 ..], b);
+        self.used += n;
+        return out;
+    }
 };
 
 fn walkValue(sc: *JScan, sink: *TokSink) !void {
@@ -1052,6 +1198,8 @@ fn walkValue(sc: *JScan, sink: *TokSink) !void {
 }
 
 fn parseVocab(sc: *JScan, sink: *TokSink) !void {
+    const t0 = nowNs();
+    defer sink.t_vocab += nowNs() - t0;
     try sc.expect('{');
     const buf = try sink.alloc.alloc(u8, 1 << 20);
     defer sink.alloc.free(buf);
@@ -1065,14 +1213,16 @@ fn parseVocab(sc: *JScan, sink: *TokSink) !void {
             _ = try sc.byte();
             continue;
         }
-        const s = try sc.stringInto(buf);
+        const s = try sc.stringLinked(buf);
         try sc.expect(':');
         const id = try sc.uint();
-        try sink.tok.vocab.put(try sink.alloc.dupe(u8, s), id);
+        try sink.tok.vocab.put(s, id);
     }
 }
 
 fn parseMerges(sc: *JScan, sink: *TokSink) !void {
+    const t0 = nowNs();
+    defer sink.t_merges += nowNs() - t0;
     try sc.expect('[');
     var buf = try sink.alloc.alloc(u8, 1 << 18);
     defer sink.alloc.free(buf);
@@ -1088,18 +1238,20 @@ fn parseMerges(sc: *JScan, sink: *TokSink) !void {
             continue;
         }
         try sc.expect('[');
-        const a = try sc.stringInto(buf);
+        const a = try sc.stringLinked(buf);
         sc.ws();
         _ = try sc.byte(); // ','
-        const b = try sc.stringInto(buf[a.len..]);
+        const b = try sc.stringLinked(buf[a.len..]);
         try sc.expect(']');
-        const key = try std.fmt.allocPrint(sink.alloc, "{s}\x00{s}", .{ a, b });
+        const key = try sink.pool.key(a, b);
         try sink.tok.merges.put(key, rank);
         rank += 1;
     }
 }
 
 fn parseAdded(sc: *JScan, sink: *TokSink) !void {
+    const t0 = nowNs();
+    defer sink.t_added += nowNs() - t0;
     try sc.expect('[');
     const buf = try sink.alloc.alloc(u8, 1 << 16);
     defer sink.alloc.free(buf);
@@ -1143,9 +1295,19 @@ fn parseAdded(sc: *JScan, sink: *TokSink) !void {
     }
 }
 
+/// The tokenizer.json mapping behind the tokenizer's string keys. Kept for the
+/// life of the process, like `g_weights`.
+var g_tok_file: ?std.Io.File.MemoryMap = null;
+
 fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
-    const data = try readFile(alloc, io, path);
-    defer alloc.free(data);
+    // The keys of `vocab` and `merges` point into this buffer rather than into
+    // copies, so it has to live as long as the tokenizer: a mapping of the file
+    // when one can be made, a plain read (never freed) otherwise.
+    var data: []const u8 = undefined;
+    if (mapFile(io, path)) |mm| {
+        g_tok_file = mm;
+        data = mm.memory;
+    } else |_| data = try readFile(std.heap.page_allocator, io, path);
 
     var tok = Tokenizer{
         .vocab = std.StringHashMap(u32).init(alloc),
@@ -1161,7 +1323,7 @@ fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
     try tok.merges.ensureTotalCapacity(700000);
 
     var sc = JScan{ .s = data, .i = 0 };
-    var sink = TokSink{ .tok = &tok, .alloc = alloc };
+    var sink = TokSink{ .tok = &tok, .alloc = alloc, .pool = .{ .alloc = alloc } };
     walkValue(&sc, &sink) catch |e| {
         const lo = if (sc.i > 120) sc.i - 120 else 0;
         const hi = @min(data.len, sc.i + 120);
@@ -1169,6 +1331,7 @@ fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
         return e;
     };
 
+    if (g_prof) std.debug.print("[toksplit] vocab {d} ms, merges {d} ms, added {d} ms\n", .{ @divTrunc(sink.t_vocab, 1_000_000), @divTrunc(sink.t_merges, 1_000_000), @divTrunc(sink.t_added, 1_000_000) });
     var lens = AList(usize).init(alloc);
     var it = tok.added.keyIterator();
     while (it.next()) |k| {
@@ -2515,6 +2678,7 @@ pub fn main(init: std.process.Init) !void {
     var play = false;
     var serve = false;
     var selftest = false;
+    var bench = false;
     var port: u16 = 8080;
     var s_policy: Policy = .model;
     var s_opts = snake.Config{};
@@ -2554,6 +2718,14 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, a, "--profile")) {
             g_prof = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--benchgemm")) {
+            bench = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--pretouch")) {
+            g_pretouch = true;
             continue;
         }
         const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or
@@ -2620,6 +2792,11 @@ pub fn main(init: std.process.Init) !void {
     g_pool.start(gpa, g_threads);
     defer g_pool.stopAll();
 
+    if (bench) {
+        try benchGemm(gpa, w);
+        return;
+    }
+
     // ---- config
     var cfg = Cfg{};
     {
@@ -2666,6 +2843,13 @@ pub fn main(init: std.process.Init) !void {
     const t2 = nowMs(io);
     try w.print("weights: {d} MB, {d} threads ({d} ms)\n", .{ mr[1].len / (1024 * 1024), g_threads, t2 - t1 });
     try w.flush();
+
+    if (g_pretouch) {
+        const t3 = nowMs(io);
+        pretouch(gpa, mr[1]);
+        try w.print("pretouch {d} MB ({d} ms)\n", .{ mr[1].len / (1024 * 1024), nowMs(io) - t3 });
+        try w.flush();
+    }
 
     if (serve) {
         const mc = try gpa.create(ModelChooser);
@@ -2825,6 +3009,10 @@ pub fn main(init: std.process.Init) !void {
 
     const t3 = nowMs(io);
     try profReport(w);
-    try w.print("\nforward {d} ms | total {d} ms\n", .{ t3 - t2, t3 - t0 });
+    try w.print("\nforward {d} ms | total {d} ms", .{ t3 - t2, t3 - t0 });
+    if (peakMem()) |pmc| {
+        try w.print(" | peak {d} MB working set, {d} MB commit", .{ pmc.PeakWorkingSetSize / (1024 * 1024), pmc.PeakPagefileUsage / (1024 * 1024) });
+    }
+    try w.print("\n", .{});
     try w.flush();
 }
