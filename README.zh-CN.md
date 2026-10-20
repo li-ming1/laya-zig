@@ -93,6 +93,10 @@ tokenizer.json 的大小与 mtime 做失效判断）。之后每次运行只映�
 每次运行结束都会自报墙钟、峰值内存与 CPU 秒数（该问题 `cpu 1.09 s`），
 不用再靠外部采样器隔着进程看。
 
+`--serve` 与 `--snake` 背后的 chooser 过去无论 prompt 多长都按 `max_len`（1024 token）
+预分配 scratch；现在按即将编码的序列长度增长。空转 `--serve` 的 commit 从 68 MB 降到
+25 MB（常驻 13 MB），而 12 步蛇的输出（每一步的选择与概率）与改动前逐字相同。
+
 提速没有拿精度去换：两边打印的选择与概率逐位相同。`--selftest` 里 GEMM 相对 f64 的
 最大误差 7.98e-6，`--dumpstats` 的逐层转储逐字节一致，`tools/refcheck.py` 用纯
 Python 独立复算 22 层加两个头，逐层偏差 2.6e-5。

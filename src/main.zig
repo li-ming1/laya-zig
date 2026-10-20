@@ -1842,6 +1842,24 @@ const Scratch = struct {
     act_in: []f32,
 };
 
+/// Buffers for `n` tokens (plus the two fixed-size ones). `att` rows are as wide
+/// as a sliding window needs, or `n` when that is wider.
+fn allocScratch(gpa: Allocator, n: usize, k: usize) !Scratch {
+    const lens = [13]usize{
+        n * D,     n * D,   n * D, n * D, n * D, n * 3 * D, n * D,
+        n * 2 * INTER, n * INTER, n * @max(n, 2 * WINDOW + 1), n * HEAD_FF, k, D + 4,
+    };
+    var s: Scratch = undefined;
+    inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+        @field(s, name) = try gpa.alloc(f32, lens[i]);
+    }
+    return s;
+}
+
+fn freeScratch(gpa: Allocator, s: Scratch) void {
+    inline for (@typeInfo(Scratch).@"struct".field_names) |name| gpa.free(@field(s, name));
+}
+
 const Cfg = struct {
     temperature: [3]f32 = .{ 1.0, 1.0, 1.0 },
     max_len: usize = MAX_LEN,
@@ -2571,42 +2589,47 @@ const Policy = enum { model, greedy, random, tiers, cycle };
 const SNAKE_INS = "Which move keeps the snake alive and reaches the food?";
 
 /// Model plus scratch buffers, kept alive across moves so a game never reloads 614 MB.
+const initial_cap: usize = 256;
+
 const ModelChooser = struct {
     gpa: Allocator,
     m: *const Model,
     tok: *const Tokenizer,
     cfg: *const Cfg,
     s: Scratch,
+    /// tokens the buffers in `s` can hold (never shrinks)
+    cap: usize,
     logits: []f32,
     pooled: []f32,
     ms: i64 = 0,
     last: WebSession.LastMove = .{ .dir = .up, .probs = .{ 0.25, 0.25, 0.25, 0.25 }, .conf = 0, .act = 0, .tokens = 0, .ms = 0 },
 
     fn init(gpa: Allocator, m: *const Model, tok: *const Tokenizer, cfg: *const Cfg) !ModelChooser {
-        const L = cfg.max_len;
-        return .{
+        const mc = ModelChooser{
             .gpa = gpa,
             .m = m,
             .tok = tok,
             .cfg = cfg,
-            .s = .{
-                .x = try gpa.alloc(f32, L * D),
-                .xn = try gpa.alloc(f32, L * D),
-                .q = try gpa.alloc(f32, L * D),
-                .k = try gpa.alloc(f32, L * D),
-                .v = try gpa.alloc(f32, L * D),
-                .qkv = try gpa.alloc(f32, L * 3 * D),
-                .ctx = try gpa.alloc(f32, L * D),
-                .mlp = try gpa.alloc(f32, L * 2 * INTER),
-                .mlp2 = try gpa.alloc(f32, L * INTER),
-                .att = try gpa.alloc(f32, L * @max(L, 2 * WINDOW + 1)),
-                .ff = try gpa.alloc(f32, L * HEAD_FF),
-                .feat = try gpa.alloc(f32, 8),
-                .act_in = try gpa.alloc(f32, D + 4),
-            },
+            .s = try allocScratch(gpa, initial_cap, 8),
+            .cap = initial_cap,
             .logits = try gpa.alloc(f32, 8),
             .pooled = try gpa.alloc(f32, D),
         };
+        return mc;
+    }
+
+    /// Grow the buffers to hold `L` tokens. The chooser outlives the question and
+    /// `max_len` is 1024, but a Snake or web prompt is 50-200 tokens: allocating
+    /// for the cap rather than for the prompt cost ~60 MB of commit the OS could
+    /// never take back. Buffers only grow, so the usual cost is zero allocations
+    /// per move.
+    fn ensure(self: *ModelChooser, L: usize) !void {
+        if (L <= self.cap) return;
+        const n = @max(L, initial_cap);
+        const old = self.s;
+        self.s = try allocScratch(self.gpa, n, 8);
+        self.cap = n;
+        freeScratch(self.gpa, old);
     }
 
     fn moveFn(ctx: *anyopaque, io: std.Io, g: *snake.Snake, status: *std.Io.Writer) anyerror!snake.Dir {
@@ -2621,6 +2644,7 @@ const ModelChooser = struct {
         try g.optionTexts(a, &opts);
 
         const sq = try buildSequence(a, self.tok, text, "choice", SNAKE_INS, &opts, self.cfg.max_len, self.cfg.head_max_len);
+        try self.ensure(sq.ids.len);
         if (g_prof) profReset();
         const t0 = nowMs(io);
         var f = FwdCtx{

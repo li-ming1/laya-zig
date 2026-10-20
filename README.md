@@ -115,6 +115,12 @@ Every run ends by printing its own wall time, peak memory and CPU seconds
 (`cpu 1.09 s` for that question), so cost can be read off a single invocation
 instead of sampled from outside.
 
+The chooser behind `--serve` and `--snake` used to size its scratch buffers for
+`max_len` (1024 tokens) whatever the prompt was; it now grows them to the
+sequence it is about to encode. Idle `--serve` went from 68 MB of commit to
+25 MB (13 MB resident), and a 12-move Snake game prints the same moves with the
+same probabilities as before the change.
+
 Neither column trades accuracy for speed — both print bit-identical probabilities
 and choices. `--selftest` puts the worst GEMM relative error at 7.98e-6 against
 f64, `--dumpstats` dumps match byte for byte, and `tools/refcheck.py` recomputes
