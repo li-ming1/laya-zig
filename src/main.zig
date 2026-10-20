@@ -910,9 +910,9 @@ fn tensorF16(infos: *const std.StringHashMap(TensorInfo), data: []const u8, name
 
 // --------------------------------------------------------------------------- tokenizer
 const Tokenizer = struct {
-    vocab: std.StringHashMap(u32),
-    merges: std.StringHashMap(u32),
-    added: std.StringHashMap(u32),
+    vocab: TokMap,
+    merges: TokMap,
+    added: TokMap,
     added_lens: []usize, // distinct lengths, descending
     start_byte: [256]bool,
     byte_ids: [256]u32,
@@ -1111,33 +1111,153 @@ fn encodeUtf8(cp: u32, buf: []u8, o: usize) !usize {
 const TokSink = struct {
     tok: *Tokenizer,
     alloc: Allocator,
-    pool: KeyPool = .{ .alloc = undefined },
+    pool: BytePool = undefined,
     t_vocab: i64 = 0,
     t_merges: i64 = 0,
     t_added: i64 = 0,
 };
 
-/// Composite merge keys (`a` NUL `b`), carved out of 1 MB blocks that are never
-/// freed (the tokenizer arena owns them) so that the slices handed to the hash
-/// map never move. 580k merges used to be 580k `allocPrint` calls, and the format
-/// machinery alone was most of the tokenizer's load time.
-const KeyPool = struct {
+/// Append-only byte pool for the tokenizer's keys, carved from 1 MB blocks that
+/// are never freed (the tokenizer arena owns them). Offsets are stable across
+/// growth, which is what lets `TokMap` -- and the on-disk cache -- refer to a key
+/// by offset instead of by pointer.
+const BytePool = struct {
     alloc: Allocator,
+    blocks: AList([]u8) = undefined,
+    lens: AList(u32) = undefined,
     cur: []u8 = &.{},
-    used: usize = 0,
+    base: u32 = 0,
+    used: u32 = 0,
 
-    fn key(self: *KeyPool, a: []const u8, b: []const u8) ![]const u8 {
+    const Entry = struct { off: u32, key: []const u8 };
+
+    fn init(alloc: Allocator) BytePool {
+        return .{ .alloc = alloc, .blocks = AList([]u8).init(alloc), .lens = AList(u32).init(alloc) };
+    }
+
+    fn add(self: *BytePool, bytes: []const u8) !Entry {
+        const at = try self.room(bytes.len);
+        const dst = self.cur[self.used..][0..bytes.len];
+        @memcpy(dst, bytes);
+        self.used += @intCast(bytes.len);
+        return .{ .off = at, .key = dst };
+    }
+
+    /// `a` NUL `b` -- the key a BPE merge is stored under, never allocated
+    /// separately the way the old `allocPrint` path did.
+    fn addPair(self: *BytePool, a: []const u8, b: []const u8) !Entry {
         const n = a.len + 1 + b.len;
+        const at = try self.room(n);
+        const dst = self.cur[self.used..][0..n];
+        @memcpy(dst[0..a.len], a);
+        dst[a.len] = 0;
+        @memcpy(dst[a.len + 1 ..], b);
+        self.used += @intCast(n);
+        return .{ .off = at, .key = dst };
+    }
+
+    fn room(self: *BytePool, n: usize) !u32 {
         if (self.used + n > self.cur.len) {
+            if (self.cur.len != 0) {
+                self.base += self.used;
+                try self.blocks.append(self.cur);
+                try self.lens.append(self.used);
+            }
             self.cur = try self.alloc.alloc(u8, @max(n, 1 << 20));
             self.used = 0;
         }
-        const out = self.cur[self.used..][0..n];
-        @memcpy(out[0..a.len], a);
-        out[a.len] = 0;
-        @memcpy(out[a.len + 1 ..], b);
-        self.used += n;
-        return out;
+        return self.base + self.used;
+    }
+
+    /// Everything added so far, contiguous. Only valid on the build path, where
+    /// the blocks are written out in their used order (that is the layout the
+    /// cache stores and the offsets already refer to).
+    fn serializeInto(self: *const BytePool, out: []u8) void {
+        var at: usize = 0;
+        for (self.blocks.items, self.lens.items) |blk, n| {
+            @memcpy(out[at..][0..n], blk[0..n]);
+            at += n;
+        }
+        @memcpy(out[at..][0..self.used], self.cur[0..self.used]);
+    }
+
+    fn total(self: *const BytePool) usize {
+        return self.base + self.used;
+    }
+};
+
+/// A string -> u32 map as four parallel arrays over one shared byte pool, open
+/// addressed with linear probing. Deliberately a fixed, self-describing layout:
+/// the whole table can be written to disk once and mapped back on the next run,
+/// so the 840k keys are never hashed or inserted again.
+const TokMap = struct {
+    hash: []const u64 = &.{}, // 0 = empty, otherwise the key's hash with bit 0 set
+    off: []const u32 = &.{},
+    len: []const u32 = &.{},
+    val: []const u32 = &.{},
+    pool: []const u8 = &.{},
+    live: u32 = 0,
+
+    fn count(self: *const TokMap) usize {
+        return self.live;
+    }
+
+    fn get(self: *const TokMap, key: []const u8) ?u32 {
+        const n = self.hash.len;
+        if (n == 0) return null;
+        const h = std.hash.Wyhash.hash(0, key) | 1;
+        var i: usize = h & (n - 1);
+        while (self.hash[i] != 0) {
+            if (self.hash[i] == h and self.len[i] == key.len and
+                std.mem.eql(u8, self.pool[self.off[i]..][0..self.len[i]], key))
+            {
+                return self.val[i];
+            }
+            i = (i + 1) & (n - 1);
+        }
+        return null;
+    }
+
+    fn put(self: *TokMap, alloc: Allocator, key: []const u8, off: u32, value: u32) !void {
+        if (self.hash.len == 0 or @as(u64, self.live + 1) * 10 >= @as(u64, self.hash.len) * 7) {
+            try self.grow(alloc);
+        }
+        // Only reached while building from JSON, when the arrays are ours; a map
+        // loaded from the cache is read-only and never written again.
+        const hash = @constCast(self.hash);
+        const offs = @constCast(self.off);
+        const lens = @constCast(self.len);
+        const vals = @constCast(self.val);
+        const h = std.hash.Wyhash.hash(0, key) | 1;
+        var i: usize = h & (self.hash.len - 1);
+        while (hash[i] != 0) : (i = (i + 1) & (self.hash.len - 1)) {}
+        hash[i] = h;
+        offs[i] = off;
+        lens[i] = @intCast(key.len);
+        vals[i] = value;
+        self.live += 1;
+    }
+
+    fn grow(self: *TokMap, alloc: Allocator) !void {
+        const n = if (self.hash.len == 0) 1 << 12 else self.hash.len * 2;
+        const h = try alloc.alloc(u64, n);
+        @memset(h, 0);
+        const o = try alloc.alloc(u32, n);
+        const l = try alloc.alloc(u32, n);
+        const v = try alloc.alloc(u32, n);
+        for (self.hash, 0..) |old_h, i| {
+            if (old_h == 0) continue;
+            var j: usize = old_h & (n - 1);
+            while (h[j] != 0) : (j = (j + 1) & (n - 1)) {}
+            h[j] = old_h;
+            o[j] = self.off[i];
+            l[j] = self.len[i];
+            v[j] = self.val[i];
+        }
+        self.hash = h;
+        self.off = o;
+        self.len = l;
+        self.val = v;
     }
 };
 
@@ -1216,7 +1336,8 @@ fn parseVocab(sc: *JScan, sink: *TokSink) !void {
         const s = try sc.stringLinked(buf);
         try sc.expect(':');
         const id = try sc.uint();
-        try sink.tok.vocab.put(s, id);
+        const e = try sink.pool.add(s);
+        try sink.tok.vocab.put(sink.alloc, e.key, e.off, id);
     }
 }
 
@@ -1243,8 +1364,8 @@ fn parseMerges(sc: *JScan, sink: *TokSink) !void {
         _ = try sc.byte(); // ','
         const b = try sc.stringLinked(buf[a.len..]);
         try sc.expect(']');
-        const key = try sink.pool.key(a, b);
-        try sink.tok.merges.put(key, rank);
+        const e = try sink.pool.addPair(a, b);
+        try sink.tok.merges.put(sink.alloc, e.key, e.off, rank);
         rank += 1;
     }
 }
@@ -1291,57 +1412,161 @@ fn parseAdded(sc: *JScan, sink: *TokSink) !void {
                 try sc.skipLit();
             }
         }
-        if (content) |c| try sink.tok.added.put(try sink.alloc.dupe(u8, c), id);
+        if (content) |c| {
+            const e = try sink.pool.add(c);
+            try sink.tok.added.put(sink.alloc, e.key, e.off, id);
+        }
     }
 }
 
 /// The tokenizer.json mapping behind the tokenizer's string keys. Kept for the
 /// life of the process, like `g_weights`.
 var g_tok_file: ?std.Io.File.MemoryMap = null;
+/// Same, for the tables loaded from `tokenizer.bin` instead of built from JSON.
+var g_tok_cache: ?TokCache = null;
 
-fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
-    // The keys of `vocab` and `merges` point into this buffer rather than into
-    // copies, so it has to live as long as the tokenizer: a mapping of the file
-    // when one can be made, a plain read (never freed) otherwise.
-    var data: []const u8 = undefined;
-    if (mapFile(io, path)) |mm| {
-        g_tok_file = mm;
-        data = mm.memory;
-    } else |_| data = try readFile(std.heap.page_allocator, io, path);
+// ---- tokenizer cache: the tables, written once and mapped later -------------
+// Layout, all little-endian, arrays in slot order:
+//   0  u32 magic         4  u32 version
+//   8  u64 src_size     16  u64 src_mtime      (of tokenizer.json: the identity
+//   24 u32 vocab_slots  28  u32 merges_slots    check that invalidates the file)
+//   32 u32 added_slots  36  u32 vocab_live
+//   40 u32 merges_live  44  u32 added_live
+//   48 u64 pool_len     56  u64 arr_bytes
+//   [vocab: hash u64[] off u32[] len u32[] val u32[]]
+//   [merges: ...] [added: ...] [pool bytes]
+// Every slot count is a power of two >= 4096, so each table's block
+// (slots*8 + 3*slots*4 bytes) stays 8-byte aligned and the arrays can be sliced
+// straight out of the mapping.
+const TC_MAGIC: u32 = 0x4B5A544C; // "LTZK"
+const TC_VERSION: u32 = 1;
+const tc_header: usize = 64;
 
+const TokCache = struct {
+    map: std.Io.File.MemoryMap,
+    vocab: TokMap,
+    merges: TokMap,
+    added: TokMap,
+};
+
+/// Bytes one table's block occupies in the cache: slots * (8 for the hash +
+/// 3 * 4 for off/len/val).
+fn tcArrayBytes(v: usize, m: usize, a: usize) usize {
+    return (v + m + a) * 20;
+}
+
+/// Best effort: on a read-only model directory the write simply fails and the
+/// next run pays the JSON parse again.
+fn tokCacheSave(alloc: Allocator, io: std.Io, cache_path: []const u8, src_size: u64, src_mtime: u64, pool: []const u8, vocab: TokMap, merges: TokMap, added: TokMap) void {
+    saveImpl(alloc, io, cache_path, src_size, src_mtime, pool, vocab, merges, added) catch {};
+}
+
+fn saveImpl(alloc: Allocator, io: std.Io, cache_path: []const u8, src_size: u64, src_mtime: u64, pool: []const u8, vocab: TokMap, merges: TokMap, added: TokMap) !void {
+    const arr = tcArrayBytes(vocab.hash.len, merges.hash.len, added.hash.len);
+    const buf = try alloc.alloc(u8, tc_header + arr + pool.len);
+    defer alloc.free(buf);
+    @memset(buf[0..tc_header], 0);
+    std.mem.writeInt(u32, buf[0..4], TC_MAGIC, .little);
+    std.mem.writeInt(u32, buf[4..8], TC_VERSION, .little);
+    std.mem.writeInt(u64, buf[8..16], src_size, .little);
+    std.mem.writeInt(u64, buf[16..24], src_mtime, .little);
+    std.mem.writeInt(u32, buf[24..28], @intCast(vocab.hash.len), .little);
+    std.mem.writeInt(u32, buf[28..32], @intCast(merges.hash.len), .little);
+    std.mem.writeInt(u32, buf[32..36], @intCast(added.hash.len), .little);
+    std.mem.writeInt(u32, buf[36..40], vocab.live, .little);
+    std.mem.writeInt(u32, buf[40..44], merges.live, .little);
+    std.mem.writeInt(u32, buf[44..48], added.live, .little);
+    std.mem.writeInt(u64, buf[48..56], pool.len, .little);
+    std.mem.writeInt(u64, buf[56..64], arr, .little);
+    var at: usize = tc_header;
+    for ([3]TokMap{ vocab, merges, added }) |m| {
+        for (m.hash) |v| {
+            std.mem.writeInt(u64, buf[at..][0..8], v, .little);
+            at += 8;
+        }
+        for ([3][]const u32{ m.off, m.len, m.val }) |col| {
+            for (col) |v| {
+                std.mem.writeInt(u32, buf[at..][0..4], v, .little);
+                at += 4;
+            }
+        }
+    }
+    @memcpy(buf[at..][0..pool.len], pool);
+    const f = try std.Io.Dir.cwd().createFile(io, cache_path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writePositionalAll(io, buf, 0);
+}
+
+fn isPow2Slots(n: usize) bool {
+    return n >= 4096 and n <= (1 << 26) and (n & (n - 1)) == 0;
+}
+
+fn tokCacheLoad(io: std.Io, cache_path: []const u8, src_size: u64, src_mtime: u64) ?TokCache {
+    const mm = mapFile(io, cache_path) catch return null;
+    const m = mm.memory;
+    if (m.len < tc_header) return null;
+    if (std.mem.readInt(u32, m[0..4], .little) != TC_MAGIC) return null;
+    if (std.mem.readInt(u32, m[4..8], .little) != TC_VERSION) return null;
+    if (std.mem.readInt(u64, m[8..16], .little) != src_size) return null;
+    if (std.mem.readInt(u64, m[16..24], .little) != src_mtime) return null;
+    const vs: usize = std.mem.readInt(u32, m[24..28], .little);
+    const ms: usize = std.mem.readInt(u32, m[28..32], .little);
+    const as: usize = std.mem.readInt(u32, m[32..36], .little);
+    const live = [3]u32{
+        std.mem.readInt(u32, m[36..40], .little),
+        std.mem.readInt(u32, m[40..44], .little),
+        std.mem.readInt(u32, m[44..48], .little),
+    };
+    const pool_len: usize = @intCast(std.mem.readInt(u64, m[48..56], .little));
+    const arr: usize = @intCast(std.mem.readInt(u64, m[56..64], .little));
+    if (!isPow2Slots(vs) or !isPow2Slots(ms) or !isPow2Slots(as)) return null;
+    if (arr != tcArrayBytes(vs, ms, as)) return null;
+    if (tc_header + arr + pool_len != m.len) return null;
+    const pool = m[tc_header + arr ..][0..pool_len];
+    const base = @intFromPtr(m.ptr);
+    var at: usize = tc_header;
+    var maps: [3]TokMap = undefined;
+    for (&maps, [3]usize{ vs, ms, as }, live) |*t, slots, nlive| {
+        t.* = .{ .pool = pool, .live = nlive };
+        const hp: [*]const u64 = @ptrCast(@alignCast(m.ptr + at));
+        t.hash = hp[0..slots];
+        at += slots * 8;
+        inline for ([3]*[]const u32{ &t.off, &t.len, &t.val }) |col| {
+            const p: [*]const u32 = @ptrCast(@alignCast(m.ptr + at));
+            col.* = p[0..slots];
+            at += slots * 4;
+        }
+        if ((base + at) % 8 != 0) at += 8 - ((base + at) % 8);
+    }
+    return .{ .map = mm, .vocab = maps[0], .merges = maps[1], .added = maps[2] };
+}
+
+/// Everything that is the same whether the tables came from JSON or from the
+/// cache: the added-token length index, the first-byte set and the byte fallback
+/// ids.
+fn finishTokenizer(alloc: Allocator, vocab: TokMap, merges: TokMap, added: TokMap) !Tokenizer {
     var tok = Tokenizer{
-        .vocab = std.StringHashMap(u32).init(alloc),
-        .merges = std.StringHashMap(u32).init(alloc),
-        .added = std.StringHashMap(u32).init(alloc),
+        .vocab = vocab,
+        .merges = merges,
+        .added = added,
         .added_lens = &.{},
         .start_byte = undefined,
         .byte_ids = undefined,
     };
     @memset(tok.start_byte[0..], false);
     @memset(tok.byte_ids[0..], 0);
-    try tok.vocab.ensureTotalCapacity(300000);
-    try tok.merges.ensureTotalCapacity(700000);
 
-    var sc = JScan{ .s = data, .i = 0 };
-    var sink = TokSink{ .tok = &tok, .alloc = alloc, .pool = .{ .alloc = alloc } };
-    walkValue(&sc, &sink) catch |e| {
-        const lo = if (sc.i > 120) sc.i - 120 else 0;
-        const hi = @min(data.len, sc.i + 120);
-        std.debug.print("tokenizer.json parse error {} at offset {d}\n...{s}...\n", .{ e, sc.i, data[lo..hi] });
-        return e;
-    };
-
-    if (g_prof) std.debug.print("[toksplit] vocab {d} ms, merges {d} ms, added {d} ms\n", .{ @divTrunc(sink.t_vocab, 1_000_000), @divTrunc(sink.t_merges, 1_000_000), @divTrunc(sink.t_added, 1_000_000) });
     var lens = AList(usize).init(alloc);
-    var it = tok.added.keyIterator();
-    while (it.next()) |k| {
-        const l = k.*.len;
+    for (added.hash, 0..) |h, i| {
+        if (h == 0) continue;
+        const k = added.pool[added.off[i]..][0..added.len[i]];
+        if (k.len == 0) continue;
         var seen = false;
         for (lens.items) |x| {
-            if (x == l) seen = true;
+            if (x == k.len) seen = true;
         }
-        if (!seen) try lens.append(l);
-        tok.start_byte[k.*[0]] = true;
+        if (!seen) try lens.append(k.len);
+        tok.start_byte[k[0]] = true;
     }
     std.mem.sort(usize, lens.items, {}, struct {
         fn lt(_: void, a: usize, b: usize) bool {
@@ -1362,6 +1587,72 @@ fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
         tok.byte_ids[b] = tok.vocab.get(&hb) orelse 3;
     }
     return tok;
+}
+
+fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
+    // tokenizer.json's size and mtime are the cache's identity check.
+    var src_size: u64 = 0;
+    var src_mtime: u64 = 0;
+    var have_src = false;
+    if (std.Io.Dir.cwd().openFile(io, path, .{})) |f| {
+        defer f.close(io);
+        if (f.stat(io)) |st| {
+            src_size = st.size;
+            src_mtime = @intCast(st.mtime.nanoseconds);
+            have_src = true;
+        } else |_| {}
+    } else |_| {}
+
+    const cache_path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path) orelse ".", "tokenizer.bin" });
+    defer alloc.free(cache_path);
+
+    if (have_src) {
+        if (tokCacheLoad(io, cache_path, src_size, src_mtime)) |c| {
+            g_tok_cache = c;
+            return finishTokenizer(alloc, c.vocab, c.merges, c.added);
+        }
+    }
+
+    // ---- no usable cache: parse tokenizer.json. The keys point into this buffer
+    // rather than into copies, so it has to live as long as the tokenizer: a
+    // mapping of the file when one can be made, a plain read otherwise.
+    var data: []const u8 = undefined;
+    if (mapFile(io, path)) |mm| {
+        g_tok_file = mm;
+        data = mm.memory;
+    } else |_| data = try readFile(std.heap.page_allocator, io, path);
+
+    var tok = Tokenizer{
+        .vocab = .{},
+        .merges = .{},
+        .added = .{},
+        .added_lens = &.{},
+        .start_byte = undefined,
+        .byte_ids = undefined,
+    };
+
+    var sc = JScan{ .s = data, .i = 0 };
+    var sink = TokSink{ .tok = &tok, .alloc = alloc, .pool = BytePool.init(alloc) };
+    walkValue(&sc, &sink) catch |e| {
+        const lo = if (sc.i > 120) sc.i - 120 else 0;
+        const hi = @min(data.len, sc.i + 120);
+        std.debug.print("tokenizer.json parse error {} at offset {d}\n...{s}...\n", .{ e, sc.i, data[lo..hi] });
+        return e;
+    };
+
+    if (g_prof) std.debug.print("[toksplit] vocab {d} ms, merges {d} ms, added {d} ms\n", .{ @divTrunc(sink.t_vocab, 1_000_000), @divTrunc(sink.t_merges, 1_000_000), @divTrunc(sink.t_added, 1_000_000) });
+
+    // One contiguous pool for all three tables. The offsets were handed out
+    // against this exact layout, so they still mean the same thing, and the maps
+    // end up with the single slice `get` needs.
+    const pool_bytes = try alloc.alloc(u8, sink.pool.total());
+    sink.pool.serializeInto(pool_bytes);
+    tok.vocab.pool = pool_bytes;
+    tok.merges.pool = pool_bytes;
+    tok.added.pool = pool_bytes;
+
+    if (have_src) tokCacheSave(alloc, io, cache_path, src_size, src_mtime, pool_bytes, tok.vocab, tok.merges, tok.added);
+    return finishTokenizer(alloc, tok.vocab, tok.merges, tok.added);
 }
 
 fn bpePiece(tok: *const Tokenizer, alloc: Allocator, piece: []const u8, out: *AList(u32)) !void {
@@ -2622,6 +2913,32 @@ fn enableAnsi() bool {
     return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
 }
 
+/// `--tokdump FILE`: one JSON line per input line, `{"text":..,"ids":[..]}`.
+/// Together with `--tokcheck FILE` this is the tokenizer's regression test: the
+/// corpus is dumped once from a build that has been verified against the model,
+/// and every later change to the tokenizer has to reproduce it byte for byte.
+fn tokDump(gpa: Allocator, io: std.Io, tok: *const Tokenizer, path: []const u8, w: *std.Io.Writer) !void {
+    const data = try readFile(gpa, io, path);
+    defer gpa.free(data);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |ln| {
+        if (ln.len == 0) continue;
+        const ids = try encodeAll(tok, aa, ln);
+        const esc = try std.json.Stringify.valueAlloc(aa, @as(std.json.Value, .{ .string = ln }), .{});
+        try w.print("{{\"text\":{s},\"ids\":[", .{esc});
+        for (ids, 0..) |id, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("{d}", .{id});
+        }
+        try w.print("]}}\n", .{});
+        _ = arena.reset(.retain_capacity);
+    }
+    try w.flush();
+}
+
 fn tokCheck(gpa: Allocator, io: std.Io, tok: *const Tokenizer, path: []const u8) !void {
     const data = try readFile(gpa, io, path);
     defer gpa.free(data);
@@ -2675,6 +2992,7 @@ pub fn main(init: std.process.Init) !void {
     var dir: []const u8 = ".";
     var json_path: ?[]const u8 = null;
     var tokcheck: ?[]const u8 = null;
+    var tokdump: ?[]const u8 = null;
     var play = false;
     var serve = false;
     var selftest = false;
@@ -2730,6 +3048,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or
             std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--tokcheck") or
+            std.mem.eql(u8, a, "--tokdump") or
             std.mem.eql(u8, a, "--size") or std.mem.eql(u8, a, "--games") or
             std.mem.eql(u8, a, "--policy") or std.mem.eql(u8, a, "--delay") or
             std.mem.eql(u8, a, "--seed") or std.mem.eql(u8, a, "--max-steps") or
@@ -2741,6 +3060,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, key, "--dir")) dir = v;
         if (std.mem.eql(u8, key, "--json")) json_path = v;
         if (std.mem.eql(u8, key, "--tokcheck")) tokcheck = v;
+        if (std.mem.eql(u8, key, "--tokdump")) tokdump = v;
         if (std.mem.eql(u8, key, "--threads")) g_threads = std.fmt.parseInt(usize, v, 10) catch 0;
         if (std.mem.eql(u8, key, "--size")) s_opts.size = @max(6, @min(std.fmt.parseInt(usize, v, 10) catch 10, 24));
         if (std.mem.eql(u8, key, "--games")) s_opts.games = @max(1, std.fmt.parseInt(usize, v, 10) catch 1);
@@ -2829,11 +3149,19 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(tok_path);
     const tok = try loadTokenizer(ta, io, tok_path);
     const t1 = nowMs(io);
-    try w.print("tokenizer: {d} vocab / {d} merges / {d} added ({d} ms)\n", .{ tok.vocab.count(), tok.merges.count(), tok.added.count(), t1 - t0 });
-    try w.flush();
+    // `--tokdump` writes the golden file to stdout, so the banner has to stay out
+    // of it; the counts it carries are checked by `--tokcheck` anyway.
+    if (tokdump == null) {
+        try w.print("tokenizer: {d} vocab / {d} merges / {d} added ({d} ms)\n", .{ tok.vocab.count(), tok.merges.count(), tok.added.count(), t1 - t0 });
+        try w.flush();
+    }
 
     if (tokcheck) |tp| {
         try tokCheck(gpa, io, &tok, tp);
+        return;
+    }
+    if (tokdump) |tp| {
+        try tokDump(gpa, io, &tok, tp, w);
         return;
     }
 

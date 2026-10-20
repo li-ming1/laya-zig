@@ -8,7 +8,7 @@
 > to a working port. It runs end to end and the forward pass is checked against an
 > independent reference implementation, and it has had two serious performance
 > passes (see *Measured* — a Snake decision costs ~170 ms on a laptop CPU, in
-> ~320 MB of working set and 84 MB of private commit), but treat it as a
+> ~320 MB of working set and 13 MB of private commit), but treat it as a
 > **half-finished project**: expect rough
 > edges and missing features. It has not been used in anything real.
 >
@@ -93,14 +93,24 @@ mapped read-only, so it is just the system file cache and is evictable — which
 why the idle server drops to 81 MB and why it can never be 614 MB again on a box
 that is short of memory.
 
-A later pass (2026-10-20) took the tokenizer's copies out of the picture:
-`tokenizer.json` is mapped instead of read, the vocab keys point straight into
-the mapping, and the 580k merge keys are carved from a flat pool instead of one
-`allocPrint` each. Idle `--serve` private bytes fell from 222 MB to 139 MB, and
-every run now reports its own peak: **84 MB of commit** for a one-question run,
-85 MB for the demo. Latency barely moved — the load is ~110 ms either way, and
-`--profile` splits it into ~20 ms vocab, ~50 ms scanning 17 MB and ~50 ms
-hashing and inserting 840k keys — so this one buys memory, not speed.
+A later pass (2026-10-20) took the tokenizer's tables out of the startup path
+entirely. `tokenizer.json` is mapped instead of read, the vocab keys point
+straight into the mapping, the 580k merge keys come from a flat pool, and the
+three tables end up as open-addressed parallel arrays that are written to
+`tokenizer/tokenizer.bin` after the first build (38 MB, invalidated by
+tokenizer.json's size and mtime). Every later run maps that file and is done:
+
+| | before | now |
+|---|---|---|
+| tokenizer load, first run (builds the cache) | ~110 ms | ~230 ms |
+| tokenizer load, every run after that | ~110 ms | **2–3 ms** |
+| one-question decision, total | ~215 ms | **86–90 ms** |
+| one-question decision, committed peak | 84 MB | **13 MB** |
+
+So a one-shot decision is now ~90 ms all in — 2–3 ms tokenizer, ~4 ms weights,
+80–85 ms forward — and the tables never touch private memory: they are pages of
+a mapped file, evictable like the weights. `--profile` splits the one-time build:
+~20 ms vocab, ~50 ms scanning 17 MB, ~50 ms hashing and inserting 840k keys.
 
 Neither column trades accuracy for speed — both print bit-identical probabilities
 and choices. `--selftest` puts the worst GEMM relative error at 7.98e-6 against
@@ -157,6 +167,11 @@ tokenizer/tokenizer.json   tokenizer                required
 rl_agent_config.json       temperature etc.         optional, defaults are built in
 encoder/config.json        NOT read — architecture constants are hardcoded
 ```
+
+One more file appears on the first run: `tokenizer/tokenizer.bin` (~38 MB), the
+tokenizer's tables in the shape the runtime wants them. It is a cache — delete it
+whenever you like, it is rebuilt from `tokenizer.json` when the size or mtime
+does not match. On a read-only model directory the build path is simply kept.
 
 ### 3. Build
 
@@ -232,6 +247,7 @@ byte-identical input to upstream.
 | `--profile` | print where each forward spends its time, by stage |
 | `--dumpstats` | per-layer hidden-state fingerprints, for `tools/refcheck.py` |
 | `--tokcheck FILE` | validate the tokenizer against golden samples |
+| `--tokdump FILE` | write that golden file: one JSON line per input line |
 | `--debug` | print marker positions and logits |
 
 ## Architecture
@@ -284,6 +300,11 @@ python -X utf8 tools/refcheck.py _dump.txt
 # 3) UI smoke test: runs src/web/index.html's script against a stubbed DOM/fetch
 #    and drives its buttons (13 checks).
 node tools/web-smoke.js
+
+# 4) Tokenizer vs the official one: 44 strings -- scripts, escapes, added tokens,
+#    whitespace runs, emoji -- whose ids come from the HuggingFace `tokenizers`
+#    library, not from this implementation.
+zig-out/bin/laya.exe --tokcheck tools/tokcheck.jsonl
 ```
 
 Check 2 is worth calling out, because it is what separates "the model behaves

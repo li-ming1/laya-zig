@@ -6,7 +6,7 @@
 >
 > 从"这个模型能不能脱离 Python 跑"到能跑通，前后大约**两个小时**。端到端能跑，
 > 前向也与独立参考实现对齐过，性能也认真优化过两轮（见「实测」：笔记本 CPU 上
-> 一步决策 ~170 ms，工作集 ~320 MB、私有 commit 84 MB），但请把它当作一个**半成品**：边角粗糙、功能不全，
+> 一步决策 ~170 ms，工作集 ~320 MB、私有 commit 13 MB），但请把它当作一个**半成品**：边角粗糙、功能不全，
 > 也还没有在真实场景里用过。
 >
 > 欢迎提 issue、指正和 PR。
@@ -75,12 +75,21 @@ Laya 是一个 **System-1 决策模型**：一次前向、非自回归、不生�
 缓存，可随时被换出 —— 这就是空转时只剩 81 MB 的原因，也是内存吃紧时它不可能再变成
 614 MB 的原因。
 
-2026-10-20 又做了一轮分词器：`tokenizer.json` 改成映射而不是整读，词表键直接指向
-映射里的字节，58 万条 merge 键也从一整块池子里切，不再每个键一次 `allocPrint`。
-空转 `--serve` 的私有内存从 222 MB 降到 139 MB；现在每次运行都会自报峰值：单问题
-一轮 **84 MB commit**，demo 85 MB。加载耗时基本没动 —— 两种做法都在 ~110 ms，
-`--profile` 会把它拆成：词表 ~20 ms、扫描 17 MB ~50 ms、84 万条键的哈希与插入
-~50 ms —— 所以这一轮买到的是内存，不是速度。
+2026-10-20 把分词器的表整个搬出了启动路径：`tokenizer.json` 改成映射而不是整读，
+词表键直接指向映射里的字节，58 万条 merge 键从一整块池子里切，三张表最终落成
+开放寻址的平行数组，在第一次构建后写进 `tokenizer/tokenizer.bin`（38 MB，用
+tokenizer.json 的大小与 mtime 做失效判断）。之后每次运行只映射这个文件：
+
+| | 之前 | 现在 |
+|---|---|---|
+| 分词器加载，首次（要建缓存） | ~110 ms | ~230 ms |
+| 分词器加载，之后的每次 | ~110 ms | **2–3 ms** |
+| 单问题决策，总耗时 | ~215 ms | **86–90 ms** |
+| 单问题决策，commit 峰值 | 84 MB | **13 MB** |
+
+也就是说一次冷启动问答现在总共 ~90 ms —— 分词 2–3 ms、权重 ~4 ms、前向 80–85 ms ——
+而且这些表不再进私有内存：它们是映射文件的页，和权重一样可被换出。`--profile` 会拆
+首次构建的耗时：词表 ~20 ms、扫描 17 MB ~50 ms、84 万条键的哈希与插入 ~50 ms。
 
 提速没有拿精度去换：两边打印的选择与概率逐位相同。`--selftest` 里 GEMM 相对 f64 的
 最大误差 7.98e-6，`--dumpstats` 的逐层转储逐字节一致，`tools/refcheck.py` 用纯
@@ -130,6 +139,10 @@ tokenizer/tokenizer.json   分词器                 必需
 rl_agent_config.json       温度等配置              可选，缺省时用内置默认值
 encoder/config.json        不读取——结构常量已硬编码，换 checkpoint 才需要改
 ```
+
+首次运行还会多出一个 `tokenizer/tokenizer.bin`（约 38 MB）：分词器的三张表，
+按运行时需要的形状直接落盘。它是缓存 —— 随时可删，大小或 mtime 与
+`tokenizer.json` 对不上时自动重建；模型目录只读时就直接走解析路径。
 
 ### 3. 构建
 
@@ -201,6 +214,7 @@ zig-out/bin/laya.exe --serve --port 8080   # 本地网页界面
 | `--profile` | 打印每次前向在各阶段上的耗时分布 |
 | `--dumpstats` | 打印逐层隐状态指纹，给 `tools/refcheck.py` 用 |
 | `--tokcheck FILE` | 用黄金样本校验分词器 |
+| `--tokdump FILE` | 生成上述黄金样本：每个输入行一条 JSON |
 | `--debug` | 打印 marker 位置与 logits |
 
 ## 模型结构
@@ -249,6 +263,10 @@ python -X utf8 tools/refcheck.py _dump.txt
 
 # 3) 页面脚本冒烟测试：桩 DOM / fetch 跑 src/web/index.html 的脚本并点按钮（13 项检查）
 node tools/web-smoke.js
+
+# 4) 分词器对照官方实现：44 条样本（多语种、转义、added token、空白连排、emoji），
+#    ids 由 HuggingFace `tokenizers` 库生成，不是本实现自产
+zig-out/bin/laya.exe --tokcheck tools/tokcheck.jsonl
 ```
 
 第 2 项值得单独说：因为它，能确定「模型输出奇怪」是模型的行为而不是端口的 bug。
