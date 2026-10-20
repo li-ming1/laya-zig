@@ -91,7 +91,8 @@ fast.
 Private bytes are the part the OS cannot take back; the rest is the weight file,
 mapped read-only, so it is just the system file cache and is evictable — which is
 why the idle server drops to 81 MB and why it can never be 614 MB again on a box
-that is short of memory.
+that is short of memory. (The 2026-10-20 pass below takes these numbers further
+still: the idle server is now 13 MB resident and 25 MB of commit.)
 
 A later pass (2026-10-20) took the tokenizer's tables out of the startup path
 entirely. `tokenizer.json` is mapped instead of read, the vocab keys point
