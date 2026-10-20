@@ -279,6 +279,10 @@ node tools/web-smoke.js
 # 4) 分词器对照官方实现：44 条样本（多语种、转义、added token、空白连排、emoji），
 #    ids 由 HuggingFace `tokenizers` 库生成，不是本实现自产
 zig-out/bin/laya.exe --tokcheck tools/tokcheck.jsonl
+
+# 5) 零样本准确性：23 条答案写在字面上的 typed-decision 用例（中/英/印地语；
+#    noul / choice / score），每个跑 N 轮，准确率与确定性一起看
+python -X utf8 tools/accuracy.py 3
 ```
 
 第 2 项值得单独说：因为它，能确定「模型输出奇怪」是模型的行为而不是端口的 bug。
@@ -332,6 +336,8 @@ src/snake.zig         贪吃蛇环境与基线策略
 src/server.zig        --serve 用的极简阻塞式 HTTP/1.1 服务
 src/web/index.html    本地界面（单文件，构建时编译进二进制）
 tools/refcheck.py     纯 Python 参考实现（整网逐层对照）
+tools/tokcheck.jsonl  44 条分词样本，ids 来自官方 tokenizers
+tools/accuracy.py     23 条 typed-decision 用例的零样本准确性探针
 tools/web-smoke.js    页面脚本冒烟测试
 ```
 

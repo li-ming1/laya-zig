@@ -321,6 +321,11 @@ node tools/web-smoke.js
 #    whitespace runs, emoji -- whose ids come from the HuggingFace `tokenizers`
 #    library, not from this implementation.
 zig-out/bin/laya.exe --tokcheck tools/tokcheck.jsonl
+
+# 5) Zero-shot accuracy: 23 typed-decision cases with the answer stated in plain
+#    words (zh / en / hi; noul, choice, score), N rounds each through the CLI,
+#    so both accuracy and determinism are visible.
+python -X utf8 tools/accuracy.py 3
 ```
 
 Check 2 is worth calling out, because it is what separates "the model behaves
@@ -421,6 +426,8 @@ src/snake.zig         Snake environment and baseline policies
 src/server.zig        a minimal blocking HTTP/1.1 server for --serve
 src/web/index.html    local UI (one file, embedded into the binary at build time)
 tools/refcheck.py     pure-Python reference implementation (whole-network diff)
+tools/tokcheck.jsonl  44 tokenizer strings with ids from the official tokenizers
+tools/accuracy.py     zero-shot accuracy probe over 23 typed-decision cases
 tools/web-smoke.js    UI script smoke test
 ```
 
