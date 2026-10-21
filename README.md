@@ -43,10 +43,11 @@ answering in about a third of a second, offline.
 - **The whole model** — RoPE, alternating global/sliding attention, GLU
   feed-forward, option-marker scoring, act/escalate head, ported layer by layer
   from the upstream reference implementation.
-- **8-wide SIMD, multi-threaded GEMM**, split over output columns so each weight row
-  is streamed from memory exactly once. Every other stage — softmax, RoPE, GLU,
-  the norms, the QKV split — is vectorized and threaded too, which is what brings
-  a Snake decision down to ~170 ms on a laptop CPU.
+- **8-wide SIMD, multi-threaded GEMM** in 16-column blocks, each weight row streamed
+  from memory exactly once and each row of the output written as one full cache
+  line. Every other stage — softmax, RoPE, GLU, the norms, the QKV split — is
+  vectorized and threaded too, which is what brings a Snake decision down to
+  ~170 ms on a laptop CPU.
 - **Verifiable** — three checks, listed below. Not "it seems to run": the forward
   pass is aligned layer by layer.
 
@@ -154,6 +155,48 @@ thing from the other side: every 8-CPU mask lands between 222 and 256 GFLOPS
 every 4-CPU mask between 74 and 89. Thread *count* is the knob; thread *placement*
 is not.
 
+### A third pass: the GEMM stops being four columns wide
+
+Every kernel up to here kept one accumulator per (token, column) pair, and 16
+architectural vector registers cap that at 2x4 = 8 — exactly the FMA
+latency/throughput product, with nothing left over — at four weight loads per
+eight FMAs. It also re-streamed `x` once per *four* columns, which is ~14 GB of
+`x` traffic for a forward that only reads 239 MB of weights.
+
+The new default kernel (`--kernel 2`) transposes instead. Sixteen weight rows are
+packed k-major into a 384x16 f32 panel (8x8 `@shuffle` transposes, one f16
+conversion per weight element), so one load covers eight *columns* and the
+accumulators span columns rather than k. Six tokens then cost twelve
+accumulators and, per k position, 8 load uops for 12 FMA uops. Two things fall
+out of the wider block: `x` is swept once per 16 columns instead of once per 4
+(3.5 GB instead of 14 GB), and a row of `out` is written as one 64-byte line
+instead of four 16-byte pieces separated by a full sweep of `x`.
+
+`--benchgemm`, same binary, best of 8, rotated A/B — `--kernel 2` against
+`--kernel 1`:
+
+| aggregate GFLOPS | 1 thread | 4 threads | 8 threads |
+|---|---|---|---|
+| packed (2) | **87** | **210** | 286 |
+| block4u (1) | 72 | 174 | **298** |
+| | +20 % | +21 % | -4 % |
+
+The honest part is the last column. On this 28 W part the eight-thread number
+does not move, and `tools/peakflops.zig` says why: a pure-register FMA probe
+reaches 878 GFLOPS on 8 threads in a 17 ms burst and 445–484 GFLOPS sustained —
+the chip gives up half its throughput to its power budget inside one second, which
+is also why whole-forward A/B on this box drifts 2–3x. Ten rotated demo runs,
+medians: **197 ms** packed against **205 ms** block4u. At one and four threads the
+gain is real and repeatable; at eight the clock is the binding constraint, not the
+kernel.
+
+Correctness is re-checked, not assumed: `--selftest` puts the packed path at
+1.1e-5 against f64 (block4u: 8.0e-6 — the packed kernel sums sequentially over k
+instead of into eight partial sums, so it is a slightly different rounding, not a
+worse one), `tools/refcheck.py` still prints PASS with the logits 8e-6 apart and
+the same softmax to four decimals, and the built-in demo prints the same
+probabilities as before.
+
 For reference, the upstream implementation needs ~33 ms per question on a T4.
 This is what a plain CPU costs with zero dependencies.
 
@@ -250,6 +293,7 @@ byte-identical input to upstream.
 | `--json FILE` | use your own state and questions |
 | `--dir DIR` | model directory (default `.`) |
 | `--threads N` | thread count (default `min(cores, 12)`) |
+| `--kernel N` | GEMM kernel: `2` packed 16-column (default), `1` block4u, `0` plain block4 |
 | `--serve [--port N]` | local browser UI (default 8080) |
 | `--snake` | let the model play Snake, one frame per move |
 | `--snake --games N` | N games, summary only |
@@ -429,6 +473,8 @@ tools/refcheck.py     pure-Python reference implementation (whole-network diff)
 tools/tokcheck.jsonl  44 tokenizer strings with ids from the official tokenizers
 tools/accuracy.py     zero-shot accuracy probe over 23 typed-decision cases
 tools/web-smoke.js    UI script smoke test
+tools/peakflops.zig   pure-register FMA probe: what the chip can sustain, so a GEMM
+                      number has a denominator (burst and sustained are not the same)
 ```
 
 ## Credits

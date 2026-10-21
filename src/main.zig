@@ -102,6 +102,9 @@ var g_debug: bool = false;
 /// hidden state, so a reference implementation can be diffed against this one
 /// layer by layer (see tools/refcheck.py). Only the first forward pass dumps.
 var g_dump_stats: bool = false;
+/// Kernel switch (see --benchgemm): 0 = plain block4, 1 = k-unrolled block4u,
+/// 2 = the packed 16-column kernel. `--benchgemm` measures 2 against 1.
+var g_kern_alt: u8 = 2;
 var g_pretouch: bool = false;
 var g_fwd_count: usize = 0;
 
@@ -420,6 +423,45 @@ fn selfTest(gpa: Allocator, w: *std.Io.Writer) !void {
     }
     try w.print("\nworst relative error vs f64: {e:.3}\n", .{worst});
 
+    // The production path is `linear16` (f16 weights, widened four rows at a time),
+    // not the f32 `matmul` above: same kernel shape, different widening and storage.
+    // Check the real one against a reference built from the *rounded* f16 weights,
+    // so the only difference left is the summation itself. The odd row counts make
+    // sure the token tail of the block kernel is exercised.
+    const shapes16 = [_]Shape{
+        .{ .rows = 63, .n = 768, .k = 768, .what = "linear16 63x768x768" },
+        .{ .rows = 64, .n = 768, .k = 1152, .what = "linear16 64x768x1152" },
+        .{ .rows = 1, .n = 768, .k = 768, .what = "linear16 1x768x768" },
+    };
+    var worst16: f64 = 0;
+    for (shapes16) |s| {
+        const x = try gpa.alloc(f32, s.rows * s.k);
+        defer gpa.free(x);
+        const wm = try gpa.alloc(f16, s.n * s.k);
+        defer gpa.free(wm);
+        const out = try gpa.alloc(f32, s.rows * s.n);
+        defer gpa.free(out);
+        for (x) |*v| v.* = rng.random().float(f32) * 2.0 - 1.0;
+        for (wm) |*v| v.* = @floatCast(rng.random().float(f32) * 2.0 - 1.0);
+
+        linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+
+        var local_worst: f64 = 0;
+        for (0..s.rows) |i| {
+            var j: usize = 0;
+            while (j < s.n) : (j += 29) {
+                var ref: f64 = 0;
+                for (0..s.k) |t| ref += @as(f64, x[i * s.k + t]) * @as(f64, @as(f32, wm[j * s.k + t]));
+                const rel = @abs(@as(f64, out[i * s.n + j]) - ref) / @max(1.0, @abs(ref));
+                if (rel > local_worst) local_worst = rel;
+            }
+        }
+        worst16 = @max(worst16, local_worst);
+        try w.print("  {d:>3}x{d:<5} x {d:>4}x{d:<5} {s:<22} max rel err {e:.2}\n", .{ s.rows, s.k, s.k, s.n, s.what, local_worst });
+    }
+    try w.print("worst relative error vs f64 (f16 path): {e:.3}\n", .{worst16});
+    worst = @max(worst, worst16);
+
     // The elementwise transcendentals run once per activation (millions of times a
     // forward). expv is checked against the f64 library exp; geluv against the
     // scalar gelu the decision head still uses -- same coefficients, different code
@@ -483,8 +525,10 @@ inline fn splatv(comptime k: f32) V {
 
 /// Eight weight elements as f32 lanes. F16 -> F32 is a widening with nothing to
 /// round, so half-precision storage changes neither the products nor the
-/// summation order: both instantiations of the kernel agree bit for bit, which is
-/// what `--selftest` and `tools/refcheck.py` check.
+/// summation order: inside one kernel the f32 and f16 weight types agree bit for
+/// bit. The two kernels do *not* agree with each other -- the packed one sums
+/// sequentially over k instead of into eight partial sums -- so `--selftest`
+/// checks each against f64 and `tools/refcheck.py` checks the whole network.
 ///
 /// The slice has to stay typed. Reading the same bytes out of a `[]const u8` with
 /// a `@bitCast` load costs 8-12x here -- this form compiles to one `vcvtph2ps`
@@ -640,6 +684,118 @@ fn four(w: []align(1) const f32, k: usize) [4][]align(1) const f32 {
     return .{ w[0..k], w[k..][0..k], w[2 * k ..][0..k], w[3 * k ..][0..k] };
 }
 
+/// 4 columns x 2 tokens with the k-loop unrolled twice: the same accumulators and
+/// the same summation order as `block4`, but the loop overhead (two pointer
+/// increments, the compare and the branch) is paid once per 16 FMAs instead of
+/// once per 8, and the second half's loads can issue while the first half's FMAs
+/// are still in flight.
+fn block4u(m: *const MM, j: usize, w: [4][]align(1) const f32) void {
+    const k = m.k;
+    const n = m.n;
+    const rows = m.rows;
+    const w0 = w[0];
+    const w1 = w[1];
+    const w2 = w[2];
+    const w3 = w[3];
+
+    var i: usize = 0;
+    while (i < rows) : (i += 2) {
+        const step: usize = if (i + 1 < rows) 1 else 0;
+        const x0 = m.x[i * k ..];
+        const x1 = m.x[(i + step) * k ..];
+        const o0 = m.out[i * n ..];
+        const o1 = m.out[(i + step) * n ..];
+        const two = step == 1;
+
+        var a00: V = @splat(0);
+        var a01: V = @splat(0);
+        var a02: V = @splat(0);
+        var a03: V = @splat(0);
+        var a10: V = @splat(0);
+        var a11: V = @splat(0);
+        var a12: V = @splat(0);
+        var a13: V = @splat(0);
+
+        var t: usize = 0;
+        while (t + 16 <= k) : (t += 16) {
+            {
+                const p0 = v8(x0, t);
+                const p1 = v8(x1, t);
+                const y0 = v8(w0, t);
+                const y1 = v8(w1, t);
+                const y2 = v8(w2, t);
+                const y3 = v8(w3, t);
+                a00 = @mulAdd(V, p0, y0, a00);
+                a01 = @mulAdd(V, p1, y0, a01);
+                a02 = @mulAdd(V, p0, y1, a02);
+                a03 = @mulAdd(V, p1, y1, a03);
+                a10 = @mulAdd(V, p0, y2, a10);
+                a11 = @mulAdd(V, p1, y2, a11);
+                a12 = @mulAdd(V, p0, y3, a12);
+                a13 = @mulAdd(V, p1, y3, a13);
+            }
+            {
+                const p0 = v8(x0, t + 8);
+                const p1 = v8(x1, t + 8);
+                const y0 = v8(w0, t + 8);
+                const y1 = v8(w1, t + 8);
+                const y2 = v8(w2, t + 8);
+                const y3 = v8(w3, t + 8);
+                a00 = @mulAdd(V, p0, y0, a00);
+                a01 = @mulAdd(V, p1, y0, a01);
+                a02 = @mulAdd(V, p0, y1, a02);
+                a03 = @mulAdd(V, p1, y1, a03);
+                a10 = @mulAdd(V, p0, y2, a10);
+                a11 = @mulAdd(V, p1, y2, a11);
+                a12 = @mulAdd(V, p0, y3, a12);
+                a13 = @mulAdd(V, p1, y3, a13);
+            }
+        }
+        while (t + 8 <= k) : (t += 8) {
+            const p0 = v8(x0, t);
+            const p1 = v8(x1, t);
+            const y0 = v8(w0, t);
+            const y1 = v8(w1, t);
+            const y2 = v8(w2, t);
+            const y3 = v8(w3, t);
+            a00 = @mulAdd(V, p0, y0, a00);
+            a01 = @mulAdd(V, p1, y0, a01);
+            a02 = @mulAdd(V, p0, y1, a02);
+            a03 = @mulAdd(V, p1, y1, a03);
+            a10 = @mulAdd(V, p0, y2, a10);
+            a11 = @mulAdd(V, p1, y2, a11);
+            a12 = @mulAdd(V, p0, y3, a12);
+            a13 = @mulAdd(V, p1, y3, a13);
+        }
+        while (t < k) : (t += 1) {
+            const c0 = w0[t];
+            const c1 = w1[t];
+            const c2 = w2[t];
+            const c3 = w3[t];
+            a00[0] = @mulAdd(f32, x0[t], c0, a00[0]);
+            a01[0] = @mulAdd(f32, x1[t], c0, a01[0]);
+            a02[0] = @mulAdd(f32, x0[t], c1, a02[0]);
+            a03[0] = @mulAdd(f32, x1[t], c1, a03[0]);
+            a10[0] = @mulAdd(f32, x0[t], c2, a10[0]);
+            a11[0] = @mulAdd(f32, x1[t], c2, a11[0]);
+            a12[0] = @mulAdd(f32, x0[t], c3, a12[0]);
+            a13[0] = @mulAdd(f32, x1[t], c3, a13[0]);
+        }
+
+        o0[j + 0] = hsum(a00);
+        o0[j + 1] = hsum(a02);
+        o0[j + 2] = hsum(a10);
+        o0[j + 3] = hsum(a12);
+        if (two) {
+            o1[j + 0] = hsum(a01);
+            o1[j + 1] = hsum(a03);
+            o1[j + 2] = hsum(a11);
+            o1[j + 3] = hsum(a13);
+        }
+    }
+}
+
+
 /// Widen four rows, in the order `block4` reads them. F16 -> F32 has nothing to
 /// round, so this is the same arithmetic done in the same order.
 fn widen4(src: []align(1) const f16, tile: []align(64) f32) void {
@@ -650,6 +806,182 @@ fn widen4(src: []align(1) const f16, tile: []align(64) f32) void {
         tile[t..][0..8].* = @bitCast(@as(@Vector(8, f32), @floatCast(h)));
     }
     while (t < n) : (t += 1) tile[t] = @floatCast(src[t]);
+}
+
+// --------------------------------------------------------------------------- packed kernel
+//
+// The 4-column kernel above keeps one accumulator per (token, column) pair, so
+// 16 architectural vector registers cap it at 2x4 = 8 accumulators and at four
+// loads per eight FMAs. That is what it costs: ~50 % of this core's FMA peak, and
+// `x` is re-streamed from L2 once per *four* columns.
+//
+// This kernel transposes instead. Sixteen weight rows are packed k-major into a
+// KC x 16 panel, so one 8-lane load covers eight *columns* and the accumulator
+// vectors span columns rather than k. Six tokens then cost twelve accumulators
+// and, per k-position, two panel loads plus six broadcasts -- 8 load uops for 12
+// FMA uops, i.e. FMA-bound at 6 cycles instead of load-bound. Two more things
+// fall out of the wider block: `x` is swept once per 16 columns instead of once
+// per 4, and a row of `out` is written as one 64-byte line instead of four
+// 16-byte pieces separated by a full sweep of `x`.
+
+/// Columns per packed block: 16 f32 is exactly one cache line.
+const PN: usize = 16;
+/// k-chunk. A PN x PKC f32 panel is 24 KB, which leaves a 48 KB L1 room for the
+/// A side and the accumulator tile. k > PKC accumulates into `out` between
+/// chunks, which is why the second chunk and later take the `accumulate` path.
+const PKC: usize = 384;
+
+inline fn unpcklo(a: V, b: V) V {
+    return @shuffle(f32, a, b, [8]i32{ 0, -1, 1, -2, 2, -3, 3, -4 });
+}
+
+inline fn unpckhi(a: V, b: V) V {
+    return @shuffle(f32, a, b, [8]i32{ 4, -5, 5, -6, 6, -7, 7, -8 });
+}
+
+/// Eight rows x eight k-positions in, eight columns out: element j of the result
+/// is row-major column j of the input block. Packing needs the transpose because
+/// the weights arrive [n][k] and the kernel wants [k][n].
+inline fn transpose8(r: [8]V) [8]V {
+    const t0 = unpcklo(r[0], r[1]);
+    const t1 = unpckhi(r[0], r[1]);
+    const t2 = unpcklo(r[2], r[3]);
+    const t3 = unpckhi(r[2], r[3]);
+    const t4 = unpcklo(r[4], r[5]);
+    const t5 = unpckhi(r[4], r[5]);
+    const t6 = unpcklo(r[6], r[7]);
+    const t7 = unpckhi(r[6], r[7]);
+
+    const q0 = @shuffle(f32, t0, t2, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const q1 = @shuffle(f32, t0, t2, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+    const q2 = @shuffle(f32, t1, t3, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const q3 = @shuffle(f32, t1, t3, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+    const p0 = @shuffle(f32, t4, t6, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const p1 = @shuffle(f32, t4, t6, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+    const p2 = @shuffle(f32, t5, t7, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const p3 = @shuffle(f32, t5, t7, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+
+    const lo = [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 };
+    const hi = [8]i32{ 4, 5, 6, 7, -5, -6, -7, -8 };
+    return .{
+        @shuffle(f32, q0, p0, lo), @shuffle(f32, q0, p0, hi),
+        @shuffle(f32, q1, p1, lo), @shuffle(f32, q1, p1, hi),
+        @shuffle(f32, q2, p2, lo), @shuffle(f32, q2, p2, hi),
+        @shuffle(f32, q3, p3, lo), @shuffle(f32, q3, p3, hi),
+    };
+}
+
+/// panel[t*PN + c] = w[(jg+c)*k + kb + t] -- 16 weight rows, k-chunk [kb, kb+kc),
+/// widened from f16 and transposed in 8x8 blocks. One conversion per weight
+/// element, same as `widen4`, and the panel is then reused by every token group.
+fn packPanel(panel: []f32, w: []align(1) const f16, k: usize, jg: usize, kb: usize, kc: usize) void {
+    var t: usize = 0;
+    while (t + 8 <= kc) : (t += 8) {
+        var lo: [8]V = undefined;
+        var hi: [8]V = undefined;
+        inline for (0..8) |c| lo[c] = wvec(f16, w[(jg + c) * k + kb + t ..], 0);
+        inline for (0..8) |c| hi[c] = wvec(f16, w[(jg + 8 + c) * k + kb + t ..], 0);
+        const cl = transpose8(lo);
+        const ch = transpose8(hi);
+        inline for (0..8) |j| {
+            panel[(t + j) * PN ..][0..8].* = @as([8]f32, @bitCast(cl[j]));
+            panel[(t + j) * PN + 8 ..][0..8].* = @as([8]f32, @bitCast(ch[j]));
+        }
+    }
+    while (t < kc) : (t += 1) {
+        inline for (0..PN) |c| panel[t * PN + c] = @floatCast(w[(jg + c) * k + kb + t]);
+    }
+}
+
+/// MRN tokens x 16 columns, accumulating k-chunk [kb, kb+kc).
+///
+/// `accumulate` is false for the first k-chunk and true afterwards, so a k that
+/// does not fit one panel costs a read-modify-write of a 64-byte line per row
+/// rather than a second buffer.
+inline fn microKernel(
+    comptime MRN: usize,
+    panel: []const f32,
+    x: []const f32,
+    out: []f32,
+    n: usize,
+    k: usize,
+    ib: usize,
+    jg: usize,
+    kb: usize,
+    kc: usize,
+    accumulate: bool,
+) void {
+    var acc: [MRN][2]V = undefined;
+    inline for (0..MRN) |i| {
+        acc[i][0] = @splat(0.0);
+        acc[i][1] = @splat(0.0);
+    }
+    var t: usize = 0;
+    while (t < kc) : (t += 1) {
+        const b0: V = @bitCast(panel[t * PN ..][0..8].*);
+        const b1: V = @bitCast(panel[t * PN + 8 ..][0..8].*);
+        inline for (0..MRN) |i| {
+            const a: V = @splat(x[(ib + i) * k + kb + t]);
+            acc[i][0] = @mulAdd(V, a, b0, acc[i][0]);
+            acc[i][1] = @mulAdd(V, a, b1, acc[i][1]);
+        }
+    }
+    inline for (0..MRN) |i| {
+        const o = out[(ib + i) * n + jg ..][0..PN];
+        if (accumulate) {
+            const p0: V = @bitCast(o[0..8].*);
+            const p1: V = @bitCast(o[8..16].*);
+            o[0..8].* = @as([8]f32, @bitCast(p0 + acc[i][0]));
+            o[8..16].* = @as([8]f32, @bitCast(p1 + acc[i][1]));
+        } else {
+            o[0..8].* = @as([8]f32, @bitCast(acc[i][0]));
+            o[8..16].* = @as([8]f32, @bitCast(acc[i][1]));
+        }
+    }
+}
+
+/// One 16-column block: pack the panel once per k-chunk, then sweep every token
+/// group against it in 6/4/2/1-row pieces so no row is left to a scalar path.
+fn packJob(ctx: *anyopaque, blo: usize, bhi: usize) void {
+    const m: *const MM16 = @ptrCast(@alignCast(ctx));
+    var buf: [PN * PKC]f32 align(64) = undefined;
+    const panel: []f32 = (&buf)[0..];
+    var b = blo;
+    while (b < bhi) : (b += 1) {
+        const jg = b * PN;
+        if (jg + PN > m.m.n) break;
+        var kb: usize = 0;
+        while (kb < m.m.k) : (kb += PKC) {
+            const kc = @min(PKC, m.m.k - kb);
+            packPanel(panel, m.w, m.m.k, jg, kb, kc);
+            const acc = kb != 0;
+            var i: usize = 0;
+            while (i + 6 <= m.m.rows) : (i += 6) microKernel(6, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+            while (i + 4 <= m.m.rows) : (i += 4) microKernel(4, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+            while (i + 2 <= m.m.rows) : (i += 2) microKernel(2, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+            while (i < m.m.rows) : (i += 1) microKernel(1, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+        }
+    }
+}
+
+/// Columns the packed kernel cannot cover (n % PN != 0, which no shape in this
+/// model hits) still go through the per-column path.
+fn packTail(ctx: *anyopaque, lo: usize, hi: usize) void {
+    const m: *const MM16 = @ptrCast(@alignCast(ctx));
+    const jlo = m.m.n / PN * PN;
+    for (lo..hi) |i| {
+        var jj = jlo;
+        while (jj < m.m.n) : (jj += 1) {
+            const wrow = m.w[jj * m.m.k ..][0..m.m.k];
+            m.m.out[i * m.m.n + jj] = dotvw(f16, m.m.x[i * m.m.k ..][0..m.m.k], wrow);
+        }
+    }
+}
+
+fn linear16Packed(alloc: Allocator, out: []f32, x: []const f32, w: []align(1) const f16, rows: usize, n: usize, k: usize) void {
+    var m = MM16{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
+    parallel(alloc, n / PN, &m, packJob);
+    if (n % PN != 0) parallel(alloc, rows, &m, packTail);
 }
 
 /// out[i][j] = dot(x[i], w[j]) -- parallelised over 4-column blocks so that each
@@ -691,7 +1023,8 @@ fn mmJob16(ctx: *anyopaque, blo: usize, bhi: usize) void {
         const j = b * 4;
         if (j + 4 <= m.m.n) {
             widen4(m.w[j * k ..][0 .. 4 * k], tile);
-            block4(&m.m, j, four(tile[0 .. 4 * k], k));
+            const rows = four(tile[0 .. 4 * k], k);
+            if (g_kern_alt == 1) block4u(&m.m, j, rows) else block4(&m.m, j, rows);
             continue;
         }
         var jj = j;
@@ -720,8 +1053,12 @@ fn matmul(alloc: Allocator, out: []f32, x: []const f32, w: []const f32, rows: us
 /// F16 weights straight out of the file, converted inside the kernel: no 478 MB
 /// F32 copy, and half the bytes streamed per forward.
 fn linear16(alloc: Allocator, out: []f32, x: []const f32, w: []align(1) const f16, bias: ?[]const f32, rows: usize, n: usize, k: usize) void {
-    var m = MM16{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
-    parallel(alloc, (n + 3) / 4, &m, mmJob16);
+    if (g_kern_alt == 2) {
+        linear16Packed(alloc, out, x, w, rows, n, k);
+    } else {
+        var m = MM16{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
+        parallel(alloc, (n + 3) / 4, &m, mmJob16);
+    }
     if (bias) |b| {
         var bias_job = Bias{ .out = out, .b = b, .n = n };
         parallel(alloc, rows, &bias_job, biasJob);
@@ -774,6 +1111,11 @@ fn cpuSeconds() ?f64 {
     return @as(f64, @floatFromInt(ticks)) / 1e7;
 }
 
+/// Signed percentage, since this Zig's formatter has no `{d:+}` spec.
+fn reportDelta(w: *std.Io.Writer, frac: f64) !void {
+    if (frac >= 0) try w.print("(+{d:.1}%)\n", .{frac * 100.0}) else try w.print("({d:.1}%)\n", .{frac * 100.0});
+}
+
 /// `--benchgemm`: the linear16 kernel on the model's real shapes, without the
 /// model. Reports GFLOPS per shape so a kernel change can be judged in seconds
 /// instead of by a noisy whole-forward A/B.
@@ -788,9 +1130,16 @@ fn benchGemm(gpa: Allocator, w: *std.Io.Writer) !void {
         .{ .rows = 175, .n = 3 * D, .k = D, .name = "qkv 175" },
         .{ .rows = 175, .n = 2 * INTER, .k = D, .name = "mlp-in 175" },
     };
-    try w.print("gemm benchmark, {d} threads\n", .{g_threads});
-    var all_flops: f64 = 0;
-    var all_ns: i64 = 0;
+    // This box drifts 2-3x between "cool" and "sustained" within tens of seconds,
+    // so a batch of one kernel followed by a batch of the other measures the
+    // thermometer. Alternate the two on every single call and keep each one's best.
+    const reps = 8;
+    const saved_kern = g_kern_alt;
+    defer g_kern_alt = saved_kern;
+    try w.print("gemm benchmark, {d} threads, rotated A/B, best of {d} calls each\n", .{ g_threads, reps });
+    var sum3: i64 = 0;
+    var sum4: i64 = 0;
+    var flops_all: f64 = 0;
     for (shapes) |s| {
         const x = try gpa.alloc(f32, s.rows * s.k);
         defer gpa.free(x);
@@ -800,29 +1149,39 @@ fn benchGemm(gpa: Allocator, w: *std.Io.Writer) !void {
         defer gpa.free(out);
         for (x, 0..) |*v, idx| v.* = @as(f32, @floatFromInt(idx % 17)) * 0.01 - 0.08;
         for (wm, 0..) |*v, idx| v.* = @floatFromInt(@as(i32, @intCast(idx % 13)) - 6);
-        const shape_flops: f64 = 2.0 * @as(f64, @floatFromInt(s.rows * s.n * s.k));
-        // ~150 ms of work per shape, at least 3 reps: long enough that the
-        // measurement is sustained clocks rather than a turbo spike
-        const reps: usize = @max(3, @as(usize, @intFromFloat(150e6 / shape_flops)));
+        const one_flops: f64 = 2.0 * @as(f64, @floatFromInt(s.rows * s.n * s.k));
+
+        g_kern_alt = 2;
         linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
-        var best: i64 = std.math.maxInt(i64);
-        var sum: i64 = 0;
-        const rounds: usize = 3;
-        for (0..rounds) |_| {
-            const t0 = nowNs();
-            for (0..reps) |_| linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
-            const dt = nowNs() - t0;
-            best = @min(best, dt);
-            sum += dt;
+        g_kern_alt = 1;
+        linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+
+        var best3: i64 = std.math.maxInt(i64);
+        var best4: i64 = std.math.maxInt(i64);
+        for (0..reps) |_| {
+            g_kern_alt = 2;
+            var t0 = nowNs();
+            linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+            best3 = @min(best3, nowNs() - t0);
+            g_kern_alt = 1;
+            t0 = nowNs();
+            linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+            best4 = @min(best4, nowNs() - t0);
         }
-        const flops = shape_flops * @as(f64, @floatFromInt(reps));
-        const gf_best = flops / @as(f64, @floatFromInt(best));
-        const gf_med = flops * @as(f64, @floatFromInt(rounds)) / @as(f64, @floatFromInt(sum));
-        try w.print("  {s:<14} {d:>4}x{d:<5} x {d:>4}x{d:<5} {d:>6.1} GFLOPS best, {d:>6.1} median\n", .{ s.name, s.rows, s.k, s.k, s.n, gf_best, gf_med });
-        all_flops += flops * @as(f64, @floatFromInt(rounds));
-        all_ns += sum;
+        const gf3 = one_flops / @as(f64, @floatFromInt(best3));
+        const gf4 = one_flops / @as(f64, @floatFromInt(best4));
+        try w.print("  {s:<14} {d:>4}x{d:<5} x {d:>4}x{d:<5}  packed {d:>6.1}  block4u {d:>6.1} GFLOPS  ", .{
+            s.name, s.rows, s.k, s.k, s.n, gf3, gf4,
+        });
+        try reportDelta(w, gf3 / gf4 - 1.0);
+        sum3 += best3;
+        sum4 += best4;
+        flops_all += one_flops;
     }
-    try w.print("  aggregate {d:.1} GFLOPS\n", .{all_flops / @as(f64, @floatFromInt(all_ns))});
+    const agg3 = flops_all / @as(f64, @floatFromInt(sum3));
+    const agg4 = flops_all / @as(f64, @floatFromInt(sum4));
+    try w.print("  aggregate      packed {d:>6.1}  block4u {d:>6.1} GFLOPS  ", .{ agg3, agg4 });
+    try reportDelta(w, agg3 / agg4 - 1.0);
     try w.flush();
 }
 
@@ -3094,7 +3453,8 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or
-            std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--tokcheck") or
+            std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--kernel") or
+            std.mem.eql(u8, a, "--tokcheck") or
             std.mem.eql(u8, a, "--tokdump") or
             std.mem.eql(u8, a, "--size") or std.mem.eql(u8, a, "--games") or
             std.mem.eql(u8, a, "--policy") or std.mem.eql(u8, a, "--delay") or
@@ -3109,6 +3469,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, key, "--tokcheck")) tokcheck = v;
         if (std.mem.eql(u8, key, "--tokdump")) tokdump = v;
         if (std.mem.eql(u8, key, "--threads")) g_threads = std.fmt.parseInt(usize, v, 10) catch 0;
+        if (std.mem.eql(u8, key, "--kernel")) g_kern_alt = @min(std.fmt.parseInt(u8, v, 10) catch 1, 2);
         if (std.mem.eql(u8, key, "--size")) s_opts.size = @max(6, @min(std.fmt.parseInt(usize, v, 10) catch 10, 24));
         if (std.mem.eql(u8, key, "--games")) s_opts.games = @max(1, std.fmt.parseInt(usize, v, 10) catch 1);
         if (std.mem.eql(u8, key, "--delay")) s_opts.delay_ms = std.fmt.parseInt(i64, v, 10) catch 0;
