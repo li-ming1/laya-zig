@@ -138,9 +138,15 @@ extern "kernel32" fn QueryPerformanceCounter(lpLargeInteger: *i64) callconv(.win
 extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) i32;
 
 fn nowNs() i64 {
-    var c: i64 = undefined;
-    _ = QueryPerformanceCounter(&c);
-    return @divTrunc(c * std.time.ns_per_s, g_qpc_freq);
+    if (comptime builtin.os.tag == .windows) {
+        var c: i64 = undefined;
+        _ = QueryPerformanceCounter(&c);
+        return @divTrunc(c * std.time.ns_per_s, g_qpc_freq);
+    }
+
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
 const STAGE_NAMES = [_][]const u8{
@@ -189,6 +195,33 @@ fn profReport(w: *std.Io.Writer) !void {
         try w.print("  {s:<9} {d:>8.1} ms {d:>6.1}% {d:>7} calls\n", .{ name, ms, pct, g_stage_calls[i] });
     }
     try w.flush();
+}
+
+fn genLow(gen: *std.atomic.Value(u64)) *const u32 {
+    comptime std.debug.assert(builtin.cpu.arch.endian() == .little);
+    return @ptrCast(&gen.raw);
+}
+
+fn wakeAll(gen: *std.atomic.Value(u64)) void {
+    switch (comptime builtin.os.tag) {
+        .windows => std.os.windows.ntdll.RtlWakeAddressAll(&gen.raw),
+        .linux => {
+            _ = std.os.linux.futex_3arg(genLow(gen), .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        },
+        else => {},
+    }
+}
+
+fn waitWhileEqual(gen: *std.atomic.Value(u64), seen: u64) void {
+    switch (comptime builtin.os.tag) {
+        .windows => {
+            _ = std.os.windows.ntdll.RtlWaitOnAddress(&gen.raw, &seen, @sizeOf(u64), null);
+        },
+        .linux => {
+            _ = std.os.linux.futex_4arg(genLow(gen), .{ .cmd = .WAIT, .private = true }, @truncate(seen), null);
+        },
+        else => std.Thread.yield() catch {},
+    }
 }
 
 const JobFn = *const fn (ctx: *anyopaque, lo: usize, hi: usize) void;
@@ -257,7 +290,7 @@ const Pool = struct {
     fn park(self: *Pool, seen: u64) void {
         _ = self.parked.fetchAdd(1, .monotonic);
         if (self.gen.load(.acquire) == seen and !self.stop.load(.acquire)) {
-            _ = std.os.windows.ntdll.RtlWaitOnAddress(&self.gen.raw, &seen, @sizeOf(u64), null);
+            waitWhileEqual(&self.gen, seen);
         }
         _ = self.parked.fetchSub(1, .monotonic);
     }
@@ -278,7 +311,7 @@ const Pool = struct {
         self.next.store(0, .monotonic);
         self.live.store(nw, .monotonic);
         _ = self.gen.fetchAdd(1, .release);
-        if (self.parked.load(.acquire) != 0) std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
+        if (self.parked.load(.acquire) != 0) wakeAll(&self.gen);
         self.drain();
         var spins: u32 = 0;
         while (self.live.load(.acquire) != 0) {
@@ -309,7 +342,7 @@ const Pool = struct {
         // CPU) and never exited. Bumping `gen` makes the value comparison inside
         // the wait fail, so a worker that arrives late does not sleep.
         _ = self.gen.fetchAdd(1, .release);
-        std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
+        wakeAll(&self.gen);
         for (self.threads.items) |t| t.join();
         self.threads.deinit();
         self.nworkers = 0;
@@ -1089,10 +1122,40 @@ const MemCounters = extern struct {
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn K32GetProcessMemoryInfo(h: ?*anyopaque, pmc: *MemCounters, cb: u32) callconv(.winapi) i32;
 
-fn peakMem() ?MemCounters {
+fn peakMem(io: std.Io) ?MemCounters {
     var pmc = MemCounters{};
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, @sizeOf(MemCounters)) == 0) return null;
+
+    if (builtin.os.tag == .windows) {
+        _ = K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, @sizeOf(MemCounters));
+        return pmc;
+    }
+
+    const status = readFile(std.heap.page_allocator, io, "/proc/self/status") catch return null;
+
+    defer std.heap.page_allocator.free(status);
+
+    var it = std.mem.splitScalar(u8, status, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "VmHWM:")) {
+            pmc.PeakWorkingSetSize = parseKb(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "VmRSS:")) {
+            pmc.WorkingSetSize = parseKb(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "VmPeak:")) {
+            pmc.PeakPagefileUsage = parseKb(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "VmSize:")) {
+            pmc.PagefileUsage = parseKb(trimmed);
+        }
+    }
+
     return pmc;
+}
+
+fn parseKb(line: []const u8) usize {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return 0;
+    const after = std.mem.trimStart(u8, line[colon + 1 ..], " \t");
+    const end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
+    return std.fmt.parseInt(usize, after[0..end], 10) catch 0;
 }
 
 const Filetime = extern struct { low: u32, high: u32 };
@@ -1102,13 +1165,19 @@ extern "kernel32" fn GetProcessTimes(h: ?*anyopaque, creation: *Filetime, exit: 
 /// compared on cost as well as on wall time -- the pool's workers spin at every
 /// barrier, and that shows up here and nowhere else.
 fn cpuSeconds() ?f64 {
-    var c: Filetime = undefined;
-    var e: Filetime = undefined;
-    var k: Filetime = undefined;
-    var u: Filetime = undefined;
-    if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) == 0) return null;
-    const ticks: u64 = (@as(u64, k.high) << 32 | k.low) + (@as(u64, u.high) << 32 | u.low);
-    return @as(f64, @floatFromInt(ticks)) / 1e7;
+    if (builtin.os.tag == .windows) {
+        var c: Filetime = undefined;
+        var e: Filetime = undefined;
+        var k: Filetime = undefined;
+        var u: Filetime = undefined;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) == 0) return null;
+        const ticks: u64 = (@as(u64, k.high) << 32 | k.low) + (@as(u64, u.high) << 32 | u.low);
+        return @as(f64, @floatFromInt(ticks)) / 1e7;
+    } else {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+        return @as(f64, @floatFromInt(@as(i64, ts.sec))) + @as(f64, @floatFromInt(@as(i64, ts.nsec))) * 1e-9;
+    }
 }
 
 /// Signed percentage, since this Zig's formatter has no `{d:+}` spec.
@@ -3746,7 +3815,7 @@ pub fn main(init: std.process.Init) !void {
     const t3 = nowMs(io);
     try profReport(w);
     try w.print("\nforward {d} ms | total {d} ms", .{ t3 - t2, t3 - t0 });
-    if (peakMem()) |pmc| {
+    if (peakMem(io)) |pmc| {
         try w.print(" | peak {d} MB working set, {d} MB commit", .{ pmc.PeakWorkingSetSize / (1024 * 1024), pmc.PeakPagefileUsage / (1024 * 1024) });
     }
     if (cpuSeconds()) |cs| {
