@@ -4,7 +4,16 @@ pub fn build(b: *std.Build) void {
     // The matmul/attention kernels are built around 8-wide SIMD, so default to the
     // host CPU model instead of the conservative baseline. `-Dtarget=` still works
     // for cross builds, where the model then falls back to baseline features.
-    const target = b.resolveTargetQuery(.{ .cpu_model = .native });
+    //
+    // `avxvnni` is subtracted because LLVM's `alderlake` model claims it while this
+    // chip's CPUID says it is absent on every logical CPU -- executing a VNNI
+    // instruction here is a SIGILL (verified with a `vpdpbusd` probe). No code in
+    // this repo asks for VNNI, so removing it changes no codegen today and keeps a
+    // future auto-vectorisation from emitting an instruction this CPU cannot run.
+    const target = b.resolveTargetQuery(.{
+        .cpu_model = .native,
+        .cpu_features_sub = std.Target.x86.featureSet(&.{.avxvnni}),
+    });
 
     // This is a numeric workload: optimized by default.
     const optimize = optimizeMode(b);

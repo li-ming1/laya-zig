@@ -6,7 +6,7 @@
 >
 > 从"这个模型能不能脱离 Python 跑"到能跑通，前后大约**两个小时**。端到端能跑，
 > 前向也与独立参考实现对齐过，性能也认真优化过两轮（见「实测」：笔记本 CPU 上
-> 一步决策 ~170 ms，占用 ~330 MB），但请把它当作一个**半成品**：边角粗糙、功能不全，
+> 一步决策 ~170 ms，工作集 ~320 MB、私有 commit 13 MB），但请把它当作一个**半成品**：边角粗糙、功能不全，
 > 也还没有在真实场景里用过。
 >
 > 欢迎提 issue、指正和 PR。
@@ -73,7 +73,30 @@ Laya 是一个 **System-1 决策模型**：一次前向、非自回归、不生�
 
 私有内存是操作系统收不回去的那部分；其余就是权重文件的只读映射，本质上是系统文件
 缓存，可随时被换出 —— 这就是空转时只剩 81 MB 的原因，也是内存吃紧时它不可能再变成
-614 MB 的原因。
+614 MB 的原因。（下面的 2026-10-20 一轮把这两个数字又往下推了一截：空转服务器现在是
+13 MB 常驻、25 MB commit。）
+
+2026-10-20 把分词器的表整个搬出了启动路径：`tokenizer.json` 改成映射而不是整读，
+词表键直接指向映射里的字节，58 万条 merge 键从一整块池子里切，三张表最终落成
+开放寻址的平行数组，在第一次构建后写进 `tokenizer/tokenizer.bin`（38 MB，用
+tokenizer.json 的大小与 mtime 做失效判断）。之后每次运行只映射这个文件：
+
+| | 之前 | 现在 |
+|---|---|---|
+| 分词器加载，首次（要建缓存） | ~110 ms | ~230 ms |
+| 分词器加载，之后的每次 | ~110 ms | **2–3 ms** |
+| 单问题决策，总耗时 | ~215 ms | **86–90 ms** |
+| 单问题决策，commit 峰值 | 84 MB | **13 MB** |
+
+也就是说一次冷启动问答现在总共 ~90 ms —— 分词 2–3 ms、权重 ~4 ms、前向 80–85 ms ——
+而且这些表不再进私有内存：它们是映射文件的页，和权重一样可被换出。`--profile` 会拆
+首次构建的耗时：词表 ~20 ms、扫描 17 MB ~50 ms、84 万条键的哈希与插入 ~50 ms。
+每次运行结束都会自报墙钟、峰值内存与 CPU 秒数（该问题 `cpu 1.09 s`），
+不用再靠外部采样器隔着进程看。
+
+`--serve` 与 `--snake` 背后的 chooser 过去无论 prompt 多长都按 `max_len`（1024 token）
+预分配 scratch；现在按即将编码的序列长度增长。空转 `--serve` 的 commit 从 68 MB 降到
+25 MB（常驻 13 MB），而 12 步蛇的输出（每一步的选择与概率）与改动前逐字相同。
 
 提速没有拿精度去换：两边打印的选择与概率逐位相同。`--selftest` 里 GEMM 相对 f64 的
 最大误差 7.98e-6，`--dumpstats` 的逐层转储逐字节一致，`tools/refcheck.py` 用纯
@@ -93,8 +116,13 @@ QKV 拆分 / serial 各 ~0.6%、residual 0.4%、embedding 0.1%。matmul 每次�
 | demo，墙上时间 | 368–375 ms | 312–337 ms | 497–512 ms |
 | demo，CPU | 1.41–1.47 s | 1.56–1.58 s | 4.42–4.45 s |
 
-12 线程只在 demo 那 2 个问题上快 ~10%，蛇的一步决策并不更快，CPU 时间却多三到六成16 线程（每个逻辑核一条，听着最直观）既慢又是三倍 CPU：屏障要等最慢的那条 SMT
+12 线程只在 demo 那 2 个问题上快 ~10%，蛇的一步决策并不更快，CPU 时间却多三到六成。
+16 线程（每个逻辑核一条，听着最直观）既慢又是三倍 CPU：屏障要等最慢的那条 SMT
 兄弟线程。
+
+2026-10-20 又用十组 CPU 亲和掩码重跑 `--benchgemm`，从另一面印证同一件事：凡是 8 核
+的掩码都落在 222–256 GFLOPS（低半、高半、每核一条、全部 16 核都一样），凡是 4 核的
+掩码都落在 74–89。**线程数才是旋钮，线程落点不是。**
 
 作为参照，官方实现在 T4 上单问题约 33 ms。纯 CPU 的代价换来零依赖。
 
@@ -123,6 +151,10 @@ tokenizer/tokenizer.json   分词器                 必需
 rl_agent_config.json       温度等配置              可选，缺省时用内置默认值
 encoder/config.json        不读取——结构常量已硬编码，换 checkpoint 才需要改
 ```
+
+首次运行还会多出一个 `tokenizer/tokenizer.bin`（约 38 MB）：分词器的三张表，
+按运行时需要的形状直接落盘。它是缓存 —— 随时可删，大小或 mtime 与
+`tokenizer.json` 对不上时自动重建；模型目录只读时就直接走解析路径。
 
 ### 3. 构建
 
@@ -189,9 +221,12 @@ zig-out/bin/laya.exe --serve --port 8080   # 本地网页界面
 | `--snake --promptv 0..9` | 让棋盘替模型回答多少（第 9 档给出哈密顿环，模型怎么答都会走满棋盘） |
 | `--size N --seed N --max-steps N --delay MS` | 蛇的参数（默认 10 / 12345 / `N^4 / 2` / 0） |
 | `--selftest` | SIMD 内核与 f64 对照 |
+| `--benchgemm` | 只跑 GEMM 内核、按本模型的形状计时，不需要权重文件 |
+| `--pretouch` | 答题前先把映射的权重页摸一遍 —— 文件不在系统缓存里时才划算，在缓存里反而多花 ~60 ms |
 | `--profile` | 打印每次前向在各阶段上的耗时分布 |
 | `--dumpstats` | 打印逐层隐状态指纹，给 `tools/refcheck.py` 用 |
 | `--tokcheck FILE` | 用黄金样本校验分词器 |
+| `--tokdump FILE` | 生成上述黄金样本：每个输入行一条 JSON |
 | `--debug` | 打印 marker 位置与 logits |
 
 ## 模型结构
@@ -240,6 +275,14 @@ python -X utf8 tools/refcheck.py _dump.txt
 
 # 3) 页面脚本冒烟测试：桩 DOM / fetch 跑 src/web/index.html 的脚本并点按钮（13 项检查）
 node tools/web-smoke.js
+
+# 4) 分词器对照官方实现：44 条样本（多语种、转义、added token、空白连排、emoji），
+#    ids 由 HuggingFace `tokenizers` 库生成，不是本实现自产
+zig-out/bin/laya.exe --tokcheck tools/tokcheck.jsonl
+
+# 5) 零样本准确性：23 条答案写在字面上的 typed-decision 用例（中/英/印地语；
+#    noul / choice / score），每个跑 N 轮，准确率与确定性一起看
+python -X utf8 tools/accuracy.py 3
 ```
 
 第 2 项值得单独说：因为它，能确定「模型输出奇怪」是模型的行为而不是端口的 bug。
@@ -293,6 +336,8 @@ src/snake.zig         贪吃蛇环境与基线策略
 src/server.zig        --serve 用的极简阻塞式 HTTP/1.1 服务
 src/web/index.html    本地界面（单文件，构建时编译进二进制）
 tools/refcheck.py     纯 Python 参考实现（整网逐层对照）
+tools/tokcheck.jsonl  44 条分词样本，ids 来自官方 tokenizers
+tools/accuracy.py     23 条 typed-decision 用例的零样本准确性探针
 tools/web-smoke.js    页面脚本冒烟测试
 ```
 

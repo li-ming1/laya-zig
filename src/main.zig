@@ -102,6 +102,10 @@ var g_debug: bool = false;
 /// hidden state, so a reference implementation can be diffed against this one
 /// layer by layer (see tools/refcheck.py). Only the first forward pass dumps.
 var g_dump_stats: bool = false;
+/// Kernel switch (see --benchgemm): 0 = plain block4, 1 = k-unrolled block4u,
+/// 2 = the packed 16-column kernel. `--benchgemm` measures 2 against 1.
+var g_kern_alt: u8 = 2;
+var g_pretouch: bool = false;
 var g_fwd_count: usize = 0;
 
 /// Kept to short lines on purpose: tools/refcheck.py reads this after PowerShell
@@ -331,6 +335,13 @@ const Pool = struct {
 
     fn stopAll(self: *Pool) void {
         self.stop.store(true, .release);
+        // A worker can pass its `stop` check and enter `park` in the window
+        // between that store and the wake below. It would then wait on `gen`,
+        // which no longer changes, and the join would never return -- a lost
+        // wakeup that showed up as a process which finished its work (0.9 s of
+        // CPU) and never exited. Bumping `gen` makes the value comparison inside
+        // the wait fail, so a worker that arrives late does not sleep.
+        _ = self.gen.fetchAdd(1, .release);
         wakeAll(&self.gen);
         for (self.threads.items) |t| t.join();
         self.threads.deinit();
@@ -445,6 +456,45 @@ fn selfTest(gpa: Allocator, w: *std.Io.Writer) !void {
     }
     try w.print("\nworst relative error vs f64: {e:.3}\n", .{worst});
 
+    // The production path is `linear16` (f16 weights, widened four rows at a time),
+    // not the f32 `matmul` above: same kernel shape, different widening and storage.
+    // Check the real one against a reference built from the *rounded* f16 weights,
+    // so the only difference left is the summation itself. The odd row counts make
+    // sure the token tail of the block kernel is exercised.
+    const shapes16 = [_]Shape{
+        .{ .rows = 63, .n = 768, .k = 768, .what = "linear16 63x768x768" },
+        .{ .rows = 64, .n = 768, .k = 1152, .what = "linear16 64x768x1152" },
+        .{ .rows = 1, .n = 768, .k = 768, .what = "linear16 1x768x768" },
+    };
+    var worst16: f64 = 0;
+    for (shapes16) |s| {
+        const x = try gpa.alloc(f32, s.rows * s.k);
+        defer gpa.free(x);
+        const wm = try gpa.alloc(f16, s.n * s.k);
+        defer gpa.free(wm);
+        const out = try gpa.alloc(f32, s.rows * s.n);
+        defer gpa.free(out);
+        for (x) |*v| v.* = rng.random().float(f32) * 2.0 - 1.0;
+        for (wm) |*v| v.* = @floatCast(rng.random().float(f32) * 2.0 - 1.0);
+
+        linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+
+        var local_worst: f64 = 0;
+        for (0..s.rows) |i| {
+            var j: usize = 0;
+            while (j < s.n) : (j += 29) {
+                var ref: f64 = 0;
+                for (0..s.k) |t| ref += @as(f64, x[i * s.k + t]) * @as(f64, @as(f32, wm[j * s.k + t]));
+                const rel = @abs(@as(f64, out[i * s.n + j]) - ref) / @max(1.0, @abs(ref));
+                if (rel > local_worst) local_worst = rel;
+            }
+        }
+        worst16 = @max(worst16, local_worst);
+        try w.print("  {d:>3}x{d:<5} x {d:>4}x{d:<5} {s:<22} max rel err {e:.2}\n", .{ s.rows, s.k, s.k, s.n, s.what, local_worst });
+    }
+    try w.print("worst relative error vs f64 (f16 path): {e:.3}\n", .{worst16});
+    worst = @max(worst, worst16);
+
     // The elementwise transcendentals run once per activation (millions of times a
     // forward). expv is checked against the f64 library exp; geluv against the
     // scalar gelu the decision head still uses -- same coefficients, different code
@@ -508,8 +558,10 @@ inline fn splatv(comptime k: f32) V {
 
 /// Eight weight elements as f32 lanes. F16 -> F32 is a widening with nothing to
 /// round, so half-precision storage changes neither the products nor the
-/// summation order: both instantiations of the kernel agree bit for bit, which is
-/// what `--selftest` and `tools/refcheck.py` check.
+/// summation order: inside one kernel the f32 and f16 weight types agree bit for
+/// bit. The two kernels do *not* agree with each other -- the packed one sums
+/// sequentially over k instead of into eight partial sums -- so `--selftest`
+/// checks each against f64 and `tools/refcheck.py` checks the whole network.
 ///
 /// The slice has to stay typed. Reading the same bytes out of a `[]const u8` with
 /// a `@bitCast` load costs 8-12x here -- this form compiles to one `vcvtph2ps`
@@ -665,6 +717,118 @@ fn four(w: []align(1) const f32, k: usize) [4][]align(1) const f32 {
     return .{ w[0..k], w[k..][0..k], w[2 * k ..][0..k], w[3 * k ..][0..k] };
 }
 
+/// 4 columns x 2 tokens with the k-loop unrolled twice: the same accumulators and
+/// the same summation order as `block4`, but the loop overhead (two pointer
+/// increments, the compare and the branch) is paid once per 16 FMAs instead of
+/// once per 8, and the second half's loads can issue while the first half's FMAs
+/// are still in flight.
+fn block4u(m: *const MM, j: usize, w: [4][]align(1) const f32) void {
+    const k = m.k;
+    const n = m.n;
+    const rows = m.rows;
+    const w0 = w[0];
+    const w1 = w[1];
+    const w2 = w[2];
+    const w3 = w[3];
+
+    var i: usize = 0;
+    while (i < rows) : (i += 2) {
+        const step: usize = if (i + 1 < rows) 1 else 0;
+        const x0 = m.x[i * k ..];
+        const x1 = m.x[(i + step) * k ..];
+        const o0 = m.out[i * n ..];
+        const o1 = m.out[(i + step) * n ..];
+        const two = step == 1;
+
+        var a00: V = @splat(0);
+        var a01: V = @splat(0);
+        var a02: V = @splat(0);
+        var a03: V = @splat(0);
+        var a10: V = @splat(0);
+        var a11: V = @splat(0);
+        var a12: V = @splat(0);
+        var a13: V = @splat(0);
+
+        var t: usize = 0;
+        while (t + 16 <= k) : (t += 16) {
+            {
+                const p0 = v8(x0, t);
+                const p1 = v8(x1, t);
+                const y0 = v8(w0, t);
+                const y1 = v8(w1, t);
+                const y2 = v8(w2, t);
+                const y3 = v8(w3, t);
+                a00 = @mulAdd(V, p0, y0, a00);
+                a01 = @mulAdd(V, p1, y0, a01);
+                a02 = @mulAdd(V, p0, y1, a02);
+                a03 = @mulAdd(V, p1, y1, a03);
+                a10 = @mulAdd(V, p0, y2, a10);
+                a11 = @mulAdd(V, p1, y2, a11);
+                a12 = @mulAdd(V, p0, y3, a12);
+                a13 = @mulAdd(V, p1, y3, a13);
+            }
+            {
+                const p0 = v8(x0, t + 8);
+                const p1 = v8(x1, t + 8);
+                const y0 = v8(w0, t + 8);
+                const y1 = v8(w1, t + 8);
+                const y2 = v8(w2, t + 8);
+                const y3 = v8(w3, t + 8);
+                a00 = @mulAdd(V, p0, y0, a00);
+                a01 = @mulAdd(V, p1, y0, a01);
+                a02 = @mulAdd(V, p0, y1, a02);
+                a03 = @mulAdd(V, p1, y1, a03);
+                a10 = @mulAdd(V, p0, y2, a10);
+                a11 = @mulAdd(V, p1, y2, a11);
+                a12 = @mulAdd(V, p0, y3, a12);
+                a13 = @mulAdd(V, p1, y3, a13);
+            }
+        }
+        while (t + 8 <= k) : (t += 8) {
+            const p0 = v8(x0, t);
+            const p1 = v8(x1, t);
+            const y0 = v8(w0, t);
+            const y1 = v8(w1, t);
+            const y2 = v8(w2, t);
+            const y3 = v8(w3, t);
+            a00 = @mulAdd(V, p0, y0, a00);
+            a01 = @mulAdd(V, p1, y0, a01);
+            a02 = @mulAdd(V, p0, y1, a02);
+            a03 = @mulAdd(V, p1, y1, a03);
+            a10 = @mulAdd(V, p0, y2, a10);
+            a11 = @mulAdd(V, p1, y2, a11);
+            a12 = @mulAdd(V, p0, y3, a12);
+            a13 = @mulAdd(V, p1, y3, a13);
+        }
+        while (t < k) : (t += 1) {
+            const c0 = w0[t];
+            const c1 = w1[t];
+            const c2 = w2[t];
+            const c3 = w3[t];
+            a00[0] = @mulAdd(f32, x0[t], c0, a00[0]);
+            a01[0] = @mulAdd(f32, x1[t], c0, a01[0]);
+            a02[0] = @mulAdd(f32, x0[t], c1, a02[0]);
+            a03[0] = @mulAdd(f32, x1[t], c1, a03[0]);
+            a10[0] = @mulAdd(f32, x0[t], c2, a10[0]);
+            a11[0] = @mulAdd(f32, x1[t], c2, a11[0]);
+            a12[0] = @mulAdd(f32, x0[t], c3, a12[0]);
+            a13[0] = @mulAdd(f32, x1[t], c3, a13[0]);
+        }
+
+        o0[j + 0] = hsum(a00);
+        o0[j + 1] = hsum(a02);
+        o0[j + 2] = hsum(a10);
+        o0[j + 3] = hsum(a12);
+        if (two) {
+            o1[j + 0] = hsum(a01);
+            o1[j + 1] = hsum(a03);
+            o1[j + 2] = hsum(a11);
+            o1[j + 3] = hsum(a13);
+        }
+    }
+}
+
+
 /// Widen four rows, in the order `block4` reads them. F16 -> F32 has nothing to
 /// round, so this is the same arithmetic done in the same order.
 fn widen4(src: []align(1) const f16, tile: []align(64) f32) void {
@@ -675,6 +839,182 @@ fn widen4(src: []align(1) const f16, tile: []align(64) f32) void {
         tile[t..][0..8].* = @bitCast(@as(@Vector(8, f32), @floatCast(h)));
     }
     while (t < n) : (t += 1) tile[t] = @floatCast(src[t]);
+}
+
+// --------------------------------------------------------------------------- packed kernel
+//
+// The 4-column kernel above keeps one accumulator per (token, column) pair, so
+// 16 architectural vector registers cap it at 2x4 = 8 accumulators and at four
+// loads per eight FMAs. That is what it costs: ~50 % of this core's FMA peak, and
+// `x` is re-streamed from L2 once per *four* columns.
+//
+// This kernel transposes instead. Sixteen weight rows are packed k-major into a
+// KC x 16 panel, so one 8-lane load covers eight *columns* and the accumulator
+// vectors span columns rather than k. Six tokens then cost twelve accumulators
+// and, per k-position, two panel loads plus six broadcasts -- 8 load uops for 12
+// FMA uops, i.e. FMA-bound at 6 cycles instead of load-bound. Two more things
+// fall out of the wider block: `x` is swept once per 16 columns instead of once
+// per 4, and a row of `out` is written as one 64-byte line instead of four
+// 16-byte pieces separated by a full sweep of `x`.
+
+/// Columns per packed block: 16 f32 is exactly one cache line.
+const PN: usize = 16;
+/// k-chunk. A PN x PKC f32 panel is 24 KB, which leaves a 48 KB L1 room for the
+/// A side and the accumulator tile. k > PKC accumulates into `out` between
+/// chunks, which is why the second chunk and later take the `accumulate` path.
+const PKC: usize = 384;
+
+inline fn unpcklo(a: V, b: V) V {
+    return @shuffle(f32, a, b, [8]i32{ 0, -1, 1, -2, 2, -3, 3, -4 });
+}
+
+inline fn unpckhi(a: V, b: V) V {
+    return @shuffle(f32, a, b, [8]i32{ 4, -5, 5, -6, 6, -7, 7, -8 });
+}
+
+/// Eight rows x eight k-positions in, eight columns out: element j of the result
+/// is row-major column j of the input block. Packing needs the transpose because
+/// the weights arrive [n][k] and the kernel wants [k][n].
+inline fn transpose8(r: [8]V) [8]V {
+    const t0 = unpcklo(r[0], r[1]);
+    const t1 = unpckhi(r[0], r[1]);
+    const t2 = unpcklo(r[2], r[3]);
+    const t3 = unpckhi(r[2], r[3]);
+    const t4 = unpcklo(r[4], r[5]);
+    const t5 = unpckhi(r[4], r[5]);
+    const t6 = unpcklo(r[6], r[7]);
+    const t7 = unpckhi(r[6], r[7]);
+
+    const q0 = @shuffle(f32, t0, t2, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const q1 = @shuffle(f32, t0, t2, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+    const q2 = @shuffle(f32, t1, t3, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const q3 = @shuffle(f32, t1, t3, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+    const p0 = @shuffle(f32, t4, t6, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const p1 = @shuffle(f32, t4, t6, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+    const p2 = @shuffle(f32, t5, t7, [8]i32{ 0, 1, -1, -2, 2, 3, -3, -4 });
+    const p3 = @shuffle(f32, t5, t7, [8]i32{ 4, 5, -5, -6, 6, 7, -7, -8 });
+
+    const lo = [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 };
+    const hi = [8]i32{ 4, 5, 6, 7, -5, -6, -7, -8 };
+    return .{
+        @shuffle(f32, q0, p0, lo), @shuffle(f32, q0, p0, hi),
+        @shuffle(f32, q1, p1, lo), @shuffle(f32, q1, p1, hi),
+        @shuffle(f32, q2, p2, lo), @shuffle(f32, q2, p2, hi),
+        @shuffle(f32, q3, p3, lo), @shuffle(f32, q3, p3, hi),
+    };
+}
+
+/// panel[t*PN + c] = w[(jg+c)*k + kb + t] -- 16 weight rows, k-chunk [kb, kb+kc),
+/// widened from f16 and transposed in 8x8 blocks. One conversion per weight
+/// element, same as `widen4`, and the panel is then reused by every token group.
+fn packPanel(panel: []f32, w: []align(1) const f16, k: usize, jg: usize, kb: usize, kc: usize) void {
+    var t: usize = 0;
+    while (t + 8 <= kc) : (t += 8) {
+        var lo: [8]V = undefined;
+        var hi: [8]V = undefined;
+        inline for (0..8) |c| lo[c] = wvec(f16, w[(jg + c) * k + kb + t ..], 0);
+        inline for (0..8) |c| hi[c] = wvec(f16, w[(jg + 8 + c) * k + kb + t ..], 0);
+        const cl = transpose8(lo);
+        const ch = transpose8(hi);
+        inline for (0..8) |j| {
+            panel[(t + j) * PN ..][0..8].* = @as([8]f32, @bitCast(cl[j]));
+            panel[(t + j) * PN + 8 ..][0..8].* = @as([8]f32, @bitCast(ch[j]));
+        }
+    }
+    while (t < kc) : (t += 1) {
+        inline for (0..PN) |c| panel[t * PN + c] = @floatCast(w[(jg + c) * k + kb + t]);
+    }
+}
+
+/// MRN tokens x 16 columns, accumulating k-chunk [kb, kb+kc).
+///
+/// `accumulate` is false for the first k-chunk and true afterwards, so a k that
+/// does not fit one panel costs a read-modify-write of a 64-byte line per row
+/// rather than a second buffer.
+inline fn microKernel(
+    comptime MRN: usize,
+    panel: []const f32,
+    x: []const f32,
+    out: []f32,
+    n: usize,
+    k: usize,
+    ib: usize,
+    jg: usize,
+    kb: usize,
+    kc: usize,
+    accumulate: bool,
+) void {
+    var acc: [MRN][2]V = undefined;
+    inline for (0..MRN) |i| {
+        acc[i][0] = @splat(0.0);
+        acc[i][1] = @splat(0.0);
+    }
+    var t: usize = 0;
+    while (t < kc) : (t += 1) {
+        const b0: V = @bitCast(panel[t * PN ..][0..8].*);
+        const b1: V = @bitCast(panel[t * PN + 8 ..][0..8].*);
+        inline for (0..MRN) |i| {
+            const a: V = @splat(x[(ib + i) * k + kb + t]);
+            acc[i][0] = @mulAdd(V, a, b0, acc[i][0]);
+            acc[i][1] = @mulAdd(V, a, b1, acc[i][1]);
+        }
+    }
+    inline for (0..MRN) |i| {
+        const o = out[(ib + i) * n + jg ..][0..PN];
+        if (accumulate) {
+            const p0: V = @bitCast(o[0..8].*);
+            const p1: V = @bitCast(o[8..16].*);
+            o[0..8].* = @as([8]f32, @bitCast(p0 + acc[i][0]));
+            o[8..16].* = @as([8]f32, @bitCast(p1 + acc[i][1]));
+        } else {
+            o[0..8].* = @as([8]f32, @bitCast(acc[i][0]));
+            o[8..16].* = @as([8]f32, @bitCast(acc[i][1]));
+        }
+    }
+}
+
+/// One 16-column block: pack the panel once per k-chunk, then sweep every token
+/// group against it in 6/4/2/1-row pieces so no row is left to a scalar path.
+fn packJob(ctx: *anyopaque, blo: usize, bhi: usize) void {
+    const m: *const MM16 = @ptrCast(@alignCast(ctx));
+    var buf: [PN * PKC]f32 align(64) = undefined;
+    const panel: []f32 = (&buf)[0..];
+    var b = blo;
+    while (b < bhi) : (b += 1) {
+        const jg = b * PN;
+        if (jg + PN > m.m.n) break;
+        var kb: usize = 0;
+        while (kb < m.m.k) : (kb += PKC) {
+            const kc = @min(PKC, m.m.k - kb);
+            packPanel(panel, m.w, m.m.k, jg, kb, kc);
+            const acc = kb != 0;
+            var i: usize = 0;
+            while (i + 6 <= m.m.rows) : (i += 6) microKernel(6, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+            while (i + 4 <= m.m.rows) : (i += 4) microKernel(4, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+            while (i + 2 <= m.m.rows) : (i += 2) microKernel(2, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+            while (i < m.m.rows) : (i += 1) microKernel(1, panel, m.m.x, m.m.out, m.m.n, m.m.k, i, jg, kb, kc, acc);
+        }
+    }
+}
+
+/// Columns the packed kernel cannot cover (n % PN != 0, which no shape in this
+/// model hits) still go through the per-column path.
+fn packTail(ctx: *anyopaque, lo: usize, hi: usize) void {
+    const m: *const MM16 = @ptrCast(@alignCast(ctx));
+    const jlo = m.m.n / PN * PN;
+    for (lo..hi) |i| {
+        var jj = jlo;
+        while (jj < m.m.n) : (jj += 1) {
+            const wrow = m.w[jj * m.m.k ..][0..m.m.k];
+            m.m.out[i * m.m.n + jj] = dotvw(f16, m.m.x[i * m.m.k ..][0..m.m.k], wrow);
+        }
+    }
+}
+
+fn linear16Packed(alloc: Allocator, out: []f32, x: []const f32, w: []align(1) const f16, rows: usize, n: usize, k: usize) void {
+    var m = MM16{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
+    parallel(alloc, n / PN, &m, packJob);
+    if (n % PN != 0) parallel(alloc, rows, &m, packTail);
 }
 
 /// out[i][j] = dot(x[i], w[j]) -- parallelised over 4-column blocks so that each
@@ -716,7 +1056,8 @@ fn mmJob16(ctx: *anyopaque, blo: usize, bhi: usize) void {
         const j = b * 4;
         if (j + 4 <= m.m.n) {
             widen4(m.w[j * k ..][0 .. 4 * k], tile);
-            block4(&m.m, j, four(tile[0 .. 4 * k], k));
+            const rows = four(tile[0 .. 4 * k], k);
+            if (g_kern_alt == 1) block4u(&m.m, j, rows) else block4(&m.m, j, rows);
             continue;
         }
         var jj = j;
@@ -745,8 +1086,12 @@ fn matmul(alloc: Allocator, out: []f32, x: []const f32, w: []const f32, rows: us
 /// F16 weights straight out of the file, converted inside the kernel: no 478 MB
 /// F32 copy, and half the bytes streamed per forward.
 fn linear16(alloc: Allocator, out: []f32, x: []const f32, w: []align(1) const f16, bias: ?[]const f32, rows: usize, n: usize, k: usize) void {
-    var m = MM16{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
-    parallel(alloc, (n + 3) / 4, &m, mmJob16);
+    if (g_kern_alt == 2) {
+        linear16Packed(alloc, out, x, w, rows, n, k);
+    } else {
+        var m = MM16{ .m = .{ .out = out, .x = x, .n = n, .k = k, .rows = rows }, .w = w };
+        parallel(alloc, (n + 3) / 4, &m, mmJob16);
+    }
     if (bias) |b| {
         var bias_job = Bias{ .out = out, .b = b, .n = n };
         parallel(alloc, rows, &bias_job, biasJob);
@@ -757,6 +1102,156 @@ fn rowDot1(a: []const f32, b: []const f32) f32 {
     var o: [1]f32 = undefined;
     rowDot(&o, a, b);
     return o[0];
+}
+
+/// Peak memory of this process, so a run reports its own cost instead of
+/// depending on an external sampler that may miss a 200 ms process entirely.
+const MemCounters = extern struct {
+    cb: u32 = @sizeOf(MemCounters),
+    PageFaultCount: u32 = 0,
+    PeakWorkingSetSize: usize = 0,
+    WorkingSetSize: usize = 0,
+    QuotaPeakPagedPoolUsage: usize = 0,
+    QuotaPagedPoolUsage: usize = 0,
+    QuotaPeakNonPagedPoolUsage: usize = 0,
+    QuotaNonPagedPoolUsage: usize = 0,
+    PagefileUsage: usize = 0,
+    PeakPagefileUsage: usize = 0,
+};
+
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn K32GetProcessMemoryInfo(h: ?*anyopaque, pmc: *MemCounters, cb: u32) callconv(.winapi) i32;
+
+fn peakMem(io: std.Io) ?MemCounters {
+    var pmc = MemCounters{};
+
+    if (builtin.os.tag == .windows) {
+        _ = K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, @sizeOf(MemCounters));
+        return pmc;
+    }
+
+    const status = readFile(std.heap.page_allocator, io, "/proc/self/status") catch return null;
+
+    defer std.heap.page_allocator.free(status);
+
+    var it = std.mem.splitScalar(u8, status, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "VmHWM:")) {
+            pmc.PeakWorkingSetSize = parseKb(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "VmRSS:")) {
+            pmc.WorkingSetSize = parseKb(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "VmPeak:")) {
+            pmc.PeakPagefileUsage = parseKb(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "VmSize:")) {
+            pmc.PagefileUsage = parseKb(trimmed);
+        }
+    }
+
+    return pmc;
+}
+
+fn parseKb(line: []const u8) usize {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return 0;
+    const after = std.mem.trimStart(u8, line[colon + 1 ..], " \t");
+    const end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
+    return std.fmt.parseInt(usize, after[0..end], 10) catch 0;
+}
+
+const Filetime = extern struct { low: u32, high: u32 };
+extern "kernel32" fn GetProcessTimes(h: ?*anyopaque, creation: *Filetime, exit: *Filetime, kernel: *Filetime, user: *Filetime) callconv(.winapi) i32;
+
+/// CPU seconds this process has burned so far (kernel + user), so a run can be
+/// compared on cost as well as on wall time -- the pool's workers spin at every
+/// barrier, and that shows up here and nowhere else.
+fn cpuSeconds() ?f64 {
+    if (builtin.os.tag == .windows) {
+        var c: Filetime = undefined;
+        var e: Filetime = undefined;
+        var k: Filetime = undefined;
+        var u: Filetime = undefined;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) == 0) return null;
+        const ticks: u64 = (@as(u64, k.high) << 32 | k.low) + (@as(u64, u.high) << 32 | u.low);
+        return @as(f64, @floatFromInt(ticks)) / 1e7;
+    } else {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+        return @as(f64, @floatFromInt(@as(i64, ts.sec))) + @as(f64, @floatFromInt(@as(i64, ts.nsec))) * 1e-9;
+    }
+}
+
+/// Signed percentage, since this Zig's formatter has no `{d:+}` spec.
+fn reportDelta(w: *std.Io.Writer, frac: f64) !void {
+    if (frac >= 0) try w.print("(+{d:.1}%)\n", .{frac * 100.0}) else try w.print("({d:.1}%)\n", .{frac * 100.0});
+}
+
+/// `--benchgemm`: the linear16 kernel on the model's real shapes, without the
+/// model. Reports GFLOPS per shape so a kernel change can be judged in seconds
+/// instead of by a noisy whole-forward A/B.
+fn benchGemm(gpa: Allocator, w: *std.Io.Writer) !void {
+    const Shape = struct { rows: usize, n: usize, k: usize, name: []const u8 };
+    const shapes = [_]Shape{
+        .{ .rows = 63, .n = 3 * D, .k = D, .name = "qkv 63" },
+        .{ .rows = 63, .n = D, .k = D, .name = "attn-out 63" },
+        .{ .rows = 63, .n = 2 * INTER, .k = D, .name = "mlp-in 63" },
+        .{ .rows = 63, .n = D, .k = INTER, .name = "mlp-out 63" },
+        .{ .rows = 63, .n = HEAD_FF, .k = D, .name = "head-ff1 63" },
+        .{ .rows = 175, .n = 3 * D, .k = D, .name = "qkv 175" },
+        .{ .rows = 175, .n = 2 * INTER, .k = D, .name = "mlp-in 175" },
+    };
+    // This box drifts 2-3x between "cool" and "sustained" within tens of seconds,
+    // so a batch of one kernel followed by a batch of the other measures the
+    // thermometer. Alternate the two on every single call and keep each one's best.
+    const reps = 8;
+    const saved_kern = g_kern_alt;
+    defer g_kern_alt = saved_kern;
+    try w.print("gemm benchmark, {d} threads, rotated A/B, best of {d} calls each\n", .{ g_threads, reps });
+    var sum3: i64 = 0;
+    var sum4: i64 = 0;
+    var flops_all: f64 = 0;
+    for (shapes) |s| {
+        const x = try gpa.alloc(f32, s.rows * s.k);
+        defer gpa.free(x);
+        const wm = try gpa.alloc(f16, s.n * s.k);
+        defer gpa.free(wm);
+        const out = try gpa.alloc(f32, s.rows * s.n);
+        defer gpa.free(out);
+        for (x, 0..) |*v, idx| v.* = @as(f32, @floatFromInt(idx % 17)) * 0.01 - 0.08;
+        for (wm, 0..) |*v, idx| v.* = @floatFromInt(@as(i32, @intCast(idx % 13)) - 6);
+        const one_flops: f64 = 2.0 * @as(f64, @floatFromInt(s.rows * s.n * s.k));
+
+        g_kern_alt = 2;
+        linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+        g_kern_alt = 1;
+        linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+
+        var best3: i64 = std.math.maxInt(i64);
+        var best4: i64 = std.math.maxInt(i64);
+        for (0..reps) |_| {
+            g_kern_alt = 2;
+            var t0 = nowNs();
+            linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+            best3 = @min(best3, nowNs() - t0);
+            g_kern_alt = 1;
+            t0 = nowNs();
+            linear16(gpa, out, x, wm, null, s.rows, s.n, s.k);
+            best4 = @min(best4, nowNs() - t0);
+        }
+        const gf3 = one_flops / @as(f64, @floatFromInt(best3));
+        const gf4 = one_flops / @as(f64, @floatFromInt(best4));
+        try w.print("  {s:<14} {d:>4}x{d:<5} x {d:>4}x{d:<5}  packed {d:>6.1}  block4u {d:>6.1} GFLOPS  ", .{
+            s.name, s.rows, s.k, s.k, s.n, gf3, gf4,
+        });
+        try reportDelta(w, gf3 / gf4 - 1.0);
+        sum3 += best3;
+        sum4 += best4;
+        flops_all += one_flops;
+    }
+    const agg3 = flops_all / @as(f64, @floatFromInt(sum3));
+    const agg4 = flops_all / @as(f64, @floatFromInt(sum4));
+    try w.print("  aggregate      packed {d:>6.1}  block4u {d:>6.1} GFLOPS  ", .{ agg3, agg4 });
+    try reportDelta(w, agg3 / agg4 - 1.0);
+    try w.flush();
 }
 
 // --------------------------------------------------------------------------- safetensors
@@ -775,6 +1270,29 @@ const ConvJob = struct {
     raw: []const u8,
     out: []f32,
 };
+
+/// One read per 4 KB page of the mapped weights, spread over the workers. The
+/// pages are cold in this process until something touches them, and the first
+/// forward would otherwise take that cost -- single-threaded, inside the GEMM
+/// inner loop. Doing it up front on all cores turns ~60k serial faults into a
+/// short parallel pass.
+const TouchJob = struct { mem: []const u8, pages: usize };
+
+fn touchJob(ctx: *anyopaque, lo: usize, hi: usize) void {
+    const j: *const TouchJob = @ptrCast(@alignCast(ctx));
+    const base = @intFromPtr(j.mem.ptr);
+    var p = lo;
+    while (p < hi) : (p += 1) {
+        const off = p * 4096;
+        if (off >= j.mem.len) return;
+        _ = @as(*const volatile u8, @ptrFromInt(base + off)).*;
+    }
+}
+
+fn pretouch(alloc: Allocator, mem: []const u8) void {
+    var job = TouchJob{ .mem = mem, .pages = (mem.len + 4095) / 4096 };
+    parallel(alloc, job.pages, &job, touchJob);
+}
 
 /// lo..hi are counted in groups of 8 elements. f16 -> f32 is exact, so this is a
 /// pure bandwidth operation; doing it a value at a time made the weight load
@@ -843,9 +1361,9 @@ fn tensorF16(infos: *const std.StringHashMap(TensorInfo), data: []const u8, name
 
 // --------------------------------------------------------------------------- tokenizer
 const Tokenizer = struct {
-    vocab: std.StringHashMap(u32),
-    merges: std.StringHashMap(u32),
-    added: std.StringHashMap(u32),
+    vocab: TokMap,
+    merges: TokMap,
+    added: TokMap,
     added_lens: []usize, // distinct lengths, descending
     start_byte: [256]bool,
     byte_ids: [256]u32,
@@ -979,6 +1497,24 @@ const JScan = struct {
         }
         return buf[0..o];
     }
+    /// The string at the cursor, without copying or decoding it when it holds no
+    /// escape sequences -- which is true of all but a few hundred of the 256k
+    /// vocab keys, and of every merge half. The slice then points into the source
+    /// buffer, so `loadTokenizer` has to keep the file mapping alive; escaped keys
+    /// take the slow path and land in `buf` as before.
+    fn stringLinked(self: *JScan, buf: []u8) ![]const u8 {
+        self.ws();
+        const start = self.i;
+        try self.expect('"');
+        const rest = self.s[self.i..];
+        const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.TruncatedJson;
+        if (std.mem.indexOfScalar(u8, rest[0..q], '\\') == null) {
+            self.i += q + 1;
+            return rest[0..q];
+        }
+        self.i = start;
+        return try self.stringInto(buf);
+    }
     fn uint(self: *JScan) !u32 {
         self.ws();
         var v: u32 = 0;
@@ -1026,6 +1562,154 @@ fn encodeUtf8(cp: u32, buf: []u8, o: usize) !usize {
 const TokSink = struct {
     tok: *Tokenizer,
     alloc: Allocator,
+    pool: BytePool = undefined,
+    t_vocab: i64 = 0,
+    t_merges: i64 = 0,
+    t_added: i64 = 0,
+};
+
+/// Append-only byte pool for the tokenizer's keys, carved from 1 MB blocks that
+/// are never freed (the tokenizer arena owns them). Offsets are stable across
+/// growth, which is what lets `TokMap` -- and the on-disk cache -- refer to a key
+/// by offset instead of by pointer.
+const BytePool = struct {
+    alloc: Allocator,
+    blocks: AList([]u8) = undefined,
+    lens: AList(u32) = undefined,
+    cur: []u8 = &.{},
+    base: u32 = 0,
+    used: u32 = 0,
+
+    const Entry = struct { off: u32, key: []const u8 };
+
+    fn init(alloc: Allocator) BytePool {
+        return .{ .alloc = alloc, .blocks = AList([]u8).init(alloc), .lens = AList(u32).init(alloc) };
+    }
+
+    fn add(self: *BytePool, bytes: []const u8) !Entry {
+        const at = try self.room(bytes.len);
+        const dst = self.cur[self.used..][0..bytes.len];
+        @memcpy(dst, bytes);
+        self.used += @intCast(bytes.len);
+        return .{ .off = at, .key = dst };
+    }
+
+    /// `a` NUL `b` -- the key a BPE merge is stored under, never allocated
+    /// separately the way the old `allocPrint` path did.
+    fn addPair(self: *BytePool, a: []const u8, b: []const u8) !Entry {
+        const n = a.len + 1 + b.len;
+        const at = try self.room(n);
+        const dst = self.cur[self.used..][0..n];
+        @memcpy(dst[0..a.len], a);
+        dst[a.len] = 0;
+        @memcpy(dst[a.len + 1 ..], b);
+        self.used += @intCast(n);
+        return .{ .off = at, .key = dst };
+    }
+
+    fn room(self: *BytePool, n: usize) !u32 {
+        if (self.used + n > self.cur.len) {
+            if (self.cur.len != 0) {
+                self.base += self.used;
+                try self.blocks.append(self.cur);
+                try self.lens.append(self.used);
+            }
+            self.cur = try self.alloc.alloc(u8, @max(n, 1 << 20));
+            self.used = 0;
+        }
+        return self.base + self.used;
+    }
+
+    /// Everything added so far, contiguous. Only valid on the build path, where
+    /// the blocks are written out in their used order (that is the layout the
+    /// cache stores and the offsets already refer to).
+    fn serializeInto(self: *const BytePool, out: []u8) void {
+        var at: usize = 0;
+        for (self.blocks.items, self.lens.items) |blk, n| {
+            @memcpy(out[at..][0..n], blk[0..n]);
+            at += n;
+        }
+        @memcpy(out[at..][0..self.used], self.cur[0..self.used]);
+    }
+
+    fn total(self: *const BytePool) usize {
+        return self.base + self.used;
+    }
+};
+
+/// A string -> u32 map as four parallel arrays over one shared byte pool, open
+/// addressed with linear probing. Deliberately a fixed, self-describing layout:
+/// the whole table can be written to disk once and mapped back on the next run,
+/// so the 840k keys are never hashed or inserted again.
+const TokMap = struct {
+    hash: []const u64 = &.{}, // 0 = empty, otherwise the key's hash with bit 0 set
+    off: []const u32 = &.{},
+    len: []const u32 = &.{},
+    val: []const u32 = &.{},
+    pool: []const u8 = &.{},
+    live: u32 = 0,
+
+    fn count(self: *const TokMap) usize {
+        return self.live;
+    }
+
+    fn get(self: *const TokMap, key: []const u8) ?u32 {
+        const n = self.hash.len;
+        if (n == 0) return null;
+        const h = std.hash.Wyhash.hash(0, key) | 1;
+        var i: usize = h & (n - 1);
+        while (self.hash[i] != 0) {
+            if (self.hash[i] == h and self.len[i] == key.len and
+                std.mem.eql(u8, self.pool[self.off[i]..][0..self.len[i]], key))
+            {
+                return self.val[i];
+            }
+            i = (i + 1) & (n - 1);
+        }
+        return null;
+    }
+
+    fn put(self: *TokMap, alloc: Allocator, key: []const u8, off: u32, value: u32) !void {
+        if (self.hash.len == 0 or @as(u64, self.live + 1) * 10 >= @as(u64, self.hash.len) * 7) {
+            try self.grow(alloc);
+        }
+        // Only reached while building from JSON, when the arrays are ours; a map
+        // loaded from the cache is read-only and never written again.
+        const hash = @constCast(self.hash);
+        const offs = @constCast(self.off);
+        const lens = @constCast(self.len);
+        const vals = @constCast(self.val);
+        const h = std.hash.Wyhash.hash(0, key) | 1;
+        var i: usize = h & (self.hash.len - 1);
+        while (hash[i] != 0) : (i = (i + 1) & (self.hash.len - 1)) {}
+        hash[i] = h;
+        offs[i] = off;
+        lens[i] = @intCast(key.len);
+        vals[i] = value;
+        self.live += 1;
+    }
+
+    fn grow(self: *TokMap, alloc: Allocator) !void {
+        const n = if (self.hash.len == 0) 1 << 12 else self.hash.len * 2;
+        const h = try alloc.alloc(u64, n);
+        @memset(h, 0);
+        const o = try alloc.alloc(u32, n);
+        const l = try alloc.alloc(u32, n);
+        const v = try alloc.alloc(u32, n);
+        for (self.hash, 0..) |old_h, i| {
+            if (old_h == 0) continue;
+            var j: usize = old_h & (n - 1);
+            while (h[j] != 0) : (j = (j + 1) & (n - 1)) {}
+            h[j] = old_h;
+            o[j] = self.off[i];
+            l[j] = self.len[i];
+            v[j] = self.val[i];
+        }
+        self.hash = h;
+        self.off = o;
+        self.len = l;
+        self.val = v;
+    }
 };
 
 fn walkValue(sc: *JScan, sink: *TokSink) !void {
@@ -1085,6 +1769,8 @@ fn walkValue(sc: *JScan, sink: *TokSink) !void {
 }
 
 fn parseVocab(sc: *JScan, sink: *TokSink) !void {
+    const t0 = nowNs();
+    defer sink.t_vocab += nowNs() - t0;
     try sc.expect('{');
     const buf = try sink.alloc.alloc(u8, 1 << 20);
     defer sink.alloc.free(buf);
@@ -1098,14 +1784,17 @@ fn parseVocab(sc: *JScan, sink: *TokSink) !void {
             _ = try sc.byte();
             continue;
         }
-        const s = try sc.stringInto(buf);
+        const s = try sc.stringLinked(buf);
         try sc.expect(':');
         const id = try sc.uint();
-        try sink.tok.vocab.put(try sink.alloc.dupe(u8, s), id);
+        const e = try sink.pool.add(s);
+        try sink.tok.vocab.put(sink.alloc, e.key, e.off, id);
     }
 }
 
 fn parseMerges(sc: *JScan, sink: *TokSink) !void {
+    const t0 = nowNs();
+    defer sink.t_merges += nowNs() - t0;
     try sc.expect('[');
     var buf = try sink.alloc.alloc(u8, 1 << 18);
     defer sink.alloc.free(buf);
@@ -1121,18 +1810,20 @@ fn parseMerges(sc: *JScan, sink: *TokSink) !void {
             continue;
         }
         try sc.expect('[');
-        const a = try sc.stringInto(buf);
+        const a = try sc.stringLinked(buf);
         sc.ws();
         _ = try sc.byte(); // ','
-        const b = try sc.stringInto(buf[a.len..]);
+        const b = try sc.stringLinked(buf[a.len..]);
         try sc.expect(']');
-        const key = try std.fmt.allocPrint(sink.alloc, "{s}\x00{s}", .{ a, b });
-        try sink.tok.merges.put(key, rank);
+        const e = try sink.pool.addPair(a, b);
+        try sink.tok.merges.put(sink.alloc, e.key, e.off, rank);
         rank += 1;
     }
 }
 
 fn parseAdded(sc: *JScan, sink: *TokSink) !void {
+    const t0 = nowNs();
+    defer sink.t_added += nowNs() - t0;
     try sc.expect('[');
     const buf = try sink.alloc.alloc(u8, 1 << 16);
     defer sink.alloc.free(buf);
@@ -1172,46 +1863,161 @@ fn parseAdded(sc: *JScan, sink: *TokSink) !void {
                 try sc.skipLit();
             }
         }
-        if (content) |c| try sink.tok.added.put(try sink.alloc.dupe(u8, c), id);
+        if (content) |c| {
+            const e = try sink.pool.add(c);
+            try sink.tok.added.put(sink.alloc, e.key, e.off, id);
+        }
     }
 }
 
-fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
-    const data = try readFile(alloc, io, path);
-    defer alloc.free(data);
+/// The tokenizer.json mapping behind the tokenizer's string keys. Kept for the
+/// life of the process, like `g_weights`.
+var g_tok_file: ?std.Io.File.MemoryMap = null;
+/// Same, for the tables loaded from `tokenizer.bin` instead of built from JSON.
+var g_tok_cache: ?TokCache = null;
 
+// ---- tokenizer cache: the tables, written once and mapped later -------------
+// Layout, all little-endian, arrays in slot order:
+//   0  u32 magic         4  u32 version
+//   8  u64 src_size     16  u64 src_mtime      (of tokenizer.json: the identity
+//   24 u32 vocab_slots  28  u32 merges_slots    check that invalidates the file)
+//   32 u32 added_slots  36  u32 vocab_live
+//   40 u32 merges_live  44  u32 added_live
+//   48 u64 pool_len     56  u64 arr_bytes
+//   [vocab: hash u64[] off u32[] len u32[] val u32[]]
+//   [merges: ...] [added: ...] [pool bytes]
+// Every slot count is a power of two >= 4096, so each table's block
+// (slots*8 + 3*slots*4 bytes) stays 8-byte aligned and the arrays can be sliced
+// straight out of the mapping.
+const TC_MAGIC: u32 = 0x4B5A544C; // "LTZK"
+const TC_VERSION: u32 = 1;
+const tc_header: usize = 64;
+
+const TokCache = struct {
+    map: std.Io.File.MemoryMap,
+    vocab: TokMap,
+    merges: TokMap,
+    added: TokMap,
+};
+
+/// Bytes one table's block occupies in the cache: slots * (8 for the hash +
+/// 3 * 4 for off/len/val).
+fn tcArrayBytes(v: usize, m: usize, a: usize) usize {
+    return (v + m + a) * 20;
+}
+
+/// Best effort: on a read-only model directory the write simply fails and the
+/// next run pays the JSON parse again.
+fn tokCacheSave(alloc: Allocator, io: std.Io, cache_path: []const u8, src_size: u64, src_mtime: u64, pool: []const u8, vocab: TokMap, merges: TokMap, added: TokMap) void {
+    saveImpl(alloc, io, cache_path, src_size, src_mtime, pool, vocab, merges, added) catch {};
+}
+
+fn saveImpl(alloc: Allocator, io: std.Io, cache_path: []const u8, src_size: u64, src_mtime: u64, pool: []const u8, vocab: TokMap, merges: TokMap, added: TokMap) !void {
+    const arr = tcArrayBytes(vocab.hash.len, merges.hash.len, added.hash.len);
+    const buf = try alloc.alloc(u8, tc_header + arr + pool.len);
+    defer alloc.free(buf);
+    @memset(buf[0..tc_header], 0);
+    std.mem.writeInt(u32, buf[0..4], TC_MAGIC, .little);
+    std.mem.writeInt(u32, buf[4..8], TC_VERSION, .little);
+    std.mem.writeInt(u64, buf[8..16], src_size, .little);
+    std.mem.writeInt(u64, buf[16..24], src_mtime, .little);
+    std.mem.writeInt(u32, buf[24..28], @intCast(vocab.hash.len), .little);
+    std.mem.writeInt(u32, buf[28..32], @intCast(merges.hash.len), .little);
+    std.mem.writeInt(u32, buf[32..36], @intCast(added.hash.len), .little);
+    std.mem.writeInt(u32, buf[36..40], vocab.live, .little);
+    std.mem.writeInt(u32, buf[40..44], merges.live, .little);
+    std.mem.writeInt(u32, buf[44..48], added.live, .little);
+    std.mem.writeInt(u64, buf[48..56], pool.len, .little);
+    std.mem.writeInt(u64, buf[56..64], arr, .little);
+    var at: usize = tc_header;
+    for ([3]TokMap{ vocab, merges, added }) |m| {
+        for (m.hash) |v| {
+            std.mem.writeInt(u64, buf[at..][0..8], v, .little);
+            at += 8;
+        }
+        for ([3][]const u32{ m.off, m.len, m.val }) |col| {
+            for (col) |v| {
+                std.mem.writeInt(u32, buf[at..][0..4], v, .little);
+                at += 4;
+            }
+        }
+    }
+    @memcpy(buf[at..][0..pool.len], pool);
+    const f = try std.Io.Dir.cwd().createFile(io, cache_path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writePositionalAll(io, buf, 0);
+}
+
+fn isPow2Slots(n: usize) bool {
+    return n >= 4096 and n <= (1 << 26) and (n & (n - 1)) == 0;
+}
+
+fn tokCacheLoad(io: std.Io, cache_path: []const u8, src_size: u64, src_mtime: u64) ?TokCache {
+    const mm = mapFile(io, cache_path) catch return null;
+    const m = mm.memory;
+    if (m.len < tc_header) return null;
+    if (std.mem.readInt(u32, m[0..4], .little) != TC_MAGIC) return null;
+    if (std.mem.readInt(u32, m[4..8], .little) != TC_VERSION) return null;
+    if (std.mem.readInt(u64, m[8..16], .little) != src_size) return null;
+    if (std.mem.readInt(u64, m[16..24], .little) != src_mtime) return null;
+    const vs: usize = std.mem.readInt(u32, m[24..28], .little);
+    const ms: usize = std.mem.readInt(u32, m[28..32], .little);
+    const as: usize = std.mem.readInt(u32, m[32..36], .little);
+    const live = [3]u32{
+        std.mem.readInt(u32, m[36..40], .little),
+        std.mem.readInt(u32, m[40..44], .little),
+        std.mem.readInt(u32, m[44..48], .little),
+    };
+    const pool_len: usize = @intCast(std.mem.readInt(u64, m[48..56], .little));
+    const arr: usize = @intCast(std.mem.readInt(u64, m[56..64], .little));
+    if (!isPow2Slots(vs) or !isPow2Slots(ms) or !isPow2Slots(as)) return null;
+    if (arr != tcArrayBytes(vs, ms, as)) return null;
+    if (tc_header + arr + pool_len != m.len) return null;
+    const pool = m[tc_header + arr ..][0..pool_len];
+    const base = @intFromPtr(m.ptr);
+    var at: usize = tc_header;
+    var maps: [3]TokMap = undefined;
+    for (&maps, [3]usize{ vs, ms, as }, live) |*t, slots, nlive| {
+        t.* = .{ .pool = pool, .live = nlive };
+        const hp: [*]const u64 = @ptrCast(@alignCast(m.ptr + at));
+        t.hash = hp[0..slots];
+        at += slots * 8;
+        inline for ([3]*[]const u32{ &t.off, &t.len, &t.val }) |col| {
+            const p: [*]const u32 = @ptrCast(@alignCast(m.ptr + at));
+            col.* = p[0..slots];
+            at += slots * 4;
+        }
+        if ((base + at) % 8 != 0) at += 8 - ((base + at) % 8);
+    }
+    return .{ .map = mm, .vocab = maps[0], .merges = maps[1], .added = maps[2] };
+}
+
+/// Everything that is the same whether the tables came from JSON or from the
+/// cache: the added-token length index, the first-byte set and the byte fallback
+/// ids.
+fn finishTokenizer(alloc: Allocator, vocab: TokMap, merges: TokMap, added: TokMap) !Tokenizer {
     var tok = Tokenizer{
-        .vocab = std.StringHashMap(u32).init(alloc),
-        .merges = std.StringHashMap(u32).init(alloc),
-        .added = std.StringHashMap(u32).init(alloc),
+        .vocab = vocab,
+        .merges = merges,
+        .added = added,
         .added_lens = &.{},
         .start_byte = undefined,
         .byte_ids = undefined,
     };
     @memset(tok.start_byte[0..], false);
     @memset(tok.byte_ids[0..], 0);
-    try tok.vocab.ensureTotalCapacity(300000);
-    try tok.merges.ensureTotalCapacity(700000);
-
-    var sc = JScan{ .s = data, .i = 0 };
-    var sink = TokSink{ .tok = &tok, .alloc = alloc };
-    walkValue(&sc, &sink) catch |e| {
-        const lo = if (sc.i > 120) sc.i - 120 else 0;
-        const hi = @min(data.len, sc.i + 120);
-        std.debug.print("tokenizer.json parse error {} at offset {d}\n...{s}...\n", .{ e, sc.i, data[lo..hi] });
-        return e;
-    };
 
     var lens = AList(usize).init(alloc);
-    var it = tok.added.keyIterator();
-    while (it.next()) |k| {
-        const l = k.*.len;
+    for (added.hash, 0..) |h, i| {
+        if (h == 0) continue;
+        const k = added.pool[added.off[i]..][0..added.len[i]];
+        if (k.len == 0) continue;
         var seen = false;
         for (lens.items) |x| {
-            if (x == l) seen = true;
+            if (x == k.len) seen = true;
         }
-        if (!seen) try lens.append(l);
-        tok.start_byte[k.*[0]] = true;
+        if (!seen) try lens.append(k.len);
+        tok.start_byte[k[0]] = true;
     }
     std.mem.sort(usize, lens.items, {}, struct {
         fn lt(_: void, a: usize, b: usize) bool {
@@ -1232,6 +2038,72 @@ fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
         tok.byte_ids[b] = tok.vocab.get(&hb) orelse 3;
     }
     return tok;
+}
+
+fn loadTokenizer(alloc: Allocator, io: std.Io, path: []const u8) !Tokenizer {
+    // tokenizer.json's size and mtime are the cache's identity check.
+    var src_size: u64 = 0;
+    var src_mtime: u64 = 0;
+    var have_src = false;
+    if (std.Io.Dir.cwd().openFile(io, path, .{})) |f| {
+        defer f.close(io);
+        if (f.stat(io)) |st| {
+            src_size = st.size;
+            src_mtime = @intCast(st.mtime.nanoseconds);
+            have_src = true;
+        } else |_| {}
+    } else |_| {}
+
+    const cache_path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path) orelse ".", "tokenizer.bin" });
+    defer alloc.free(cache_path);
+
+    if (have_src) {
+        if (tokCacheLoad(io, cache_path, src_size, src_mtime)) |c| {
+            g_tok_cache = c;
+            return finishTokenizer(alloc, c.vocab, c.merges, c.added);
+        }
+    }
+
+    // ---- no usable cache: parse tokenizer.json. The keys point into this buffer
+    // rather than into copies, so it has to live as long as the tokenizer: a
+    // mapping of the file when one can be made, a plain read otherwise.
+    var data: []const u8 = undefined;
+    if (mapFile(io, path)) |mm| {
+        g_tok_file = mm;
+        data = mm.memory;
+    } else |_| data = try readFile(std.heap.page_allocator, io, path);
+
+    var tok = Tokenizer{
+        .vocab = .{},
+        .merges = .{},
+        .added = .{},
+        .added_lens = &.{},
+        .start_byte = undefined,
+        .byte_ids = undefined,
+    };
+
+    var sc = JScan{ .s = data, .i = 0 };
+    var sink = TokSink{ .tok = &tok, .alloc = alloc, .pool = BytePool.init(alloc) };
+    walkValue(&sc, &sink) catch |e| {
+        const lo = if (sc.i > 120) sc.i - 120 else 0;
+        const hi = @min(data.len, sc.i + 120);
+        std.debug.print("tokenizer.json parse error {} at offset {d}\n...{s}...\n", .{ e, sc.i, data[lo..hi] });
+        return e;
+    };
+
+    if (g_prof) std.debug.print("[toksplit] vocab {d} ms, merges {d} ms, added {d} ms\n", .{ @divTrunc(sink.t_vocab, 1_000_000), @divTrunc(sink.t_merges, 1_000_000), @divTrunc(sink.t_added, 1_000_000) });
+
+    // One contiguous pool for all three tables. The offsets were handed out
+    // against this exact layout, so they still mean the same thing, and the maps
+    // end up with the single slice `get` needs.
+    const pool_bytes = try alloc.alloc(u8, sink.pool.total());
+    sink.pool.serializeInto(pool_bytes);
+    tok.vocab.pool = pool_bytes;
+    tok.merges.pool = pool_bytes;
+    tok.added.pool = pool_bytes;
+
+    if (have_src) tokCacheSave(alloc, io, cache_path, src_size, src_mtime, pool_bytes, tok.vocab, tok.merges, tok.added);
+    return finishTokenizer(alloc, tok.vocab, tok.merges, tok.added);
 }
 
 fn bpePiece(tok: *const Tokenizer, alloc: Allocator, piece: []const u8, out: *AList(u32)) !void {
@@ -1404,6 +2276,24 @@ const Scratch = struct {
     feat: []f32,
     act_in: []f32,
 };
+
+/// Buffers for `n` tokens (plus the two fixed-size ones). `att` rows are as wide
+/// as a sliding window needs, or `n` when that is wider.
+fn allocScratch(gpa: Allocator, n: usize, k: usize) !Scratch {
+    const lens = [13]usize{
+        n * D,     n * D,   n * D, n * D, n * D, n * 3 * D, n * D,
+        n * 2 * INTER, n * INTER, n * @max(n, 2 * WINDOW + 1), n * HEAD_FF, k, D + 4,
+    };
+    var s: Scratch = undefined;
+    inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
+        @field(s, name) = try gpa.alloc(f32, lens[i]);
+    }
+    return s;
+}
+
+fn freeScratch(gpa: Allocator, s: Scratch) void {
+    inline for (@typeInfo(Scratch).@"struct".field_names) |name| gpa.free(@field(s, name));
+}
 
 const Cfg = struct {
     temperature: [3]f32 = .{ 1.0, 1.0, 1.0 },
@@ -2134,42 +3024,47 @@ const Policy = enum { model, greedy, random, tiers, cycle };
 const SNAKE_INS = "Which move keeps the snake alive and reaches the food?";
 
 /// Model plus scratch buffers, kept alive across moves so a game never reloads 614 MB.
+const initial_cap: usize = 256;
+
 const ModelChooser = struct {
     gpa: Allocator,
     m: *const Model,
     tok: *const Tokenizer,
     cfg: *const Cfg,
     s: Scratch,
+    /// tokens the buffers in `s` can hold (never shrinks)
+    cap: usize,
     logits: []f32,
     pooled: []f32,
     ms: i64 = 0,
     last: WebSession.LastMove = .{ .dir = .up, .probs = .{ 0.25, 0.25, 0.25, 0.25 }, .conf = 0, .act = 0, .tokens = 0, .ms = 0 },
 
     fn init(gpa: Allocator, m: *const Model, tok: *const Tokenizer, cfg: *const Cfg) !ModelChooser {
-        const L = cfg.max_len;
-        return .{
+        const mc = ModelChooser{
             .gpa = gpa,
             .m = m,
             .tok = tok,
             .cfg = cfg,
-            .s = .{
-                .x = try gpa.alloc(f32, L * D),
-                .xn = try gpa.alloc(f32, L * D),
-                .q = try gpa.alloc(f32, L * D),
-                .k = try gpa.alloc(f32, L * D),
-                .v = try gpa.alloc(f32, L * D),
-                .qkv = try gpa.alloc(f32, L * 3 * D),
-                .ctx = try gpa.alloc(f32, L * D),
-                .mlp = try gpa.alloc(f32, L * 2 * INTER),
-                .mlp2 = try gpa.alloc(f32, L * INTER),
-                .att = try gpa.alloc(f32, L * @max(L, 2 * WINDOW + 1)),
-                .ff = try gpa.alloc(f32, L * HEAD_FF),
-                .feat = try gpa.alloc(f32, 8),
-                .act_in = try gpa.alloc(f32, D + 4),
-            },
+            .s = try allocScratch(gpa, initial_cap, 8),
+            .cap = initial_cap,
             .logits = try gpa.alloc(f32, 8),
             .pooled = try gpa.alloc(f32, D),
         };
+        return mc;
+    }
+
+    /// Grow the buffers to hold `L` tokens. The chooser outlives the question and
+    /// `max_len` is 1024, but a Snake or web prompt is 50-200 tokens: allocating
+    /// for the cap rather than for the prompt cost ~60 MB of commit the OS could
+    /// never take back. Buffers only grow, so the usual cost is zero allocations
+    /// per move.
+    fn ensure(self: *ModelChooser, L: usize) !void {
+        if (L <= self.cap) return;
+        const n = @max(L, initial_cap);
+        const old = self.s;
+        self.s = try allocScratch(self.gpa, n, 8);
+        self.cap = n;
+        freeScratch(self.gpa, old);
     }
 
     fn moveFn(ctx: *anyopaque, io: std.Io, g: *snake.Snake, status: *std.Io.Writer) anyerror!snake.Dir {
@@ -2184,6 +3079,7 @@ const ModelChooser = struct {
         try g.optionTexts(a, &opts);
 
         const sq = try buildSequence(a, self.tok, text, "choice", SNAKE_INS, &opts, self.cfg.max_len, self.cfg.head_max_len);
+        try self.ensure(sq.ids.len);
         if (g_prof) profReset();
         const t0 = nowMs(io);
         var f = FwdCtx{
@@ -2492,6 +3388,32 @@ fn enableAnsi() bool {
     return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
 }
 
+/// `--tokdump FILE`: one JSON line per input line, `{"text":..,"ids":[..]}`.
+/// Together with `--tokcheck FILE` this is the tokenizer's regression test: the
+/// corpus is dumped once from a build that has been verified against the model,
+/// and every later change to the tokenizer has to reproduce it byte for byte.
+fn tokDump(gpa: Allocator, io: std.Io, tok: *const Tokenizer, path: []const u8, w: *std.Io.Writer) !void {
+    const data = try readFile(gpa, io, path);
+    defer gpa.free(data);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |ln| {
+        if (ln.len == 0) continue;
+        const ids = try encodeAll(tok, aa, ln);
+        const esc = try std.json.Stringify.valueAlloc(aa, @as(std.json.Value, .{ .string = ln }), .{});
+        try w.print("{{\"text\":{s},\"ids\":[", .{esc});
+        for (ids, 0..) |id, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("{d}", .{id});
+        }
+        try w.print("]}}\n", .{});
+        _ = arena.reset(.retain_capacity);
+    }
+    try w.flush();
+}
+
 fn tokCheck(gpa: Allocator, io: std.Io, tok: *const Tokenizer, path: []const u8) !void {
     const data = try readFile(gpa, io, path);
     defer gpa.free(data);
@@ -2545,9 +3467,11 @@ pub fn main(init: std.process.Init) !void {
     var dir: []const u8 = ".";
     var json_path: ?[]const u8 = null;
     var tokcheck: ?[]const u8 = null;
+    var tokdump: ?[]const u8 = null;
     var play = false;
     var serve = false;
     var selftest = false;
+    var bench = false;
     var port: u16 = 8080;
     var s_policy: Policy = .model;
     var s_opts = snake.Config{};
@@ -2589,8 +3513,18 @@ pub fn main(init: std.process.Init) !void {
             g_prof = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--benchgemm")) {
+            bench = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--pretouch")) {
+            g_pretouch = true;
+            continue;
+        }
         const takes_value = std.mem.eql(u8, a, "--dir") or std.mem.eql(u8, a, "--json") or
-            std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--tokcheck") or
+            std.mem.eql(u8, a, "--threads") or std.mem.eql(u8, a, "--kernel") or
+            std.mem.eql(u8, a, "--tokcheck") or
+            std.mem.eql(u8, a, "--tokdump") or
             std.mem.eql(u8, a, "--size") or std.mem.eql(u8, a, "--games") or
             std.mem.eql(u8, a, "--policy") or std.mem.eql(u8, a, "--delay") or
             std.mem.eql(u8, a, "--seed") or std.mem.eql(u8, a, "--max-steps") or
@@ -2602,7 +3536,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, key, "--dir")) dir = v;
         if (std.mem.eql(u8, key, "--json")) json_path = v;
         if (std.mem.eql(u8, key, "--tokcheck")) tokcheck = v;
+        if (std.mem.eql(u8, key, "--tokdump")) tokdump = v;
         if (std.mem.eql(u8, key, "--threads")) g_threads = std.fmt.parseInt(usize, v, 10) catch 0;
+        if (std.mem.eql(u8, key, "--kernel")) g_kern_alt = @min(std.fmt.parseInt(u8, v, 10) catch 1, 2);
         if (std.mem.eql(u8, key, "--size")) s_opts.size = @max(6, @min(std.fmt.parseInt(usize, v, 10) catch 10, 24));
         if (std.mem.eql(u8, key, "--games")) s_opts.games = @max(1, std.fmt.parseInt(usize, v, 10) catch 1);
         if (std.mem.eql(u8, key, "--delay")) s_opts.delay_ms = std.fmt.parseInt(i64, v, 10) catch 0;
@@ -2653,6 +3589,11 @@ pub fn main(init: std.process.Init) !void {
     g_pool.start(gpa, g_threads);
     defer g_pool.stopAll();
 
+    if (bench) {
+        try benchGemm(gpa, w);
+        return;
+    }
+
     // ---- config
     var cfg = Cfg{};
     {
@@ -2685,11 +3626,19 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(tok_path);
     const tok = try loadTokenizer(ta, io, tok_path);
     const t1 = nowMs(io);
-    try w.print("tokenizer: {d} vocab / {d} merges / {d} added ({d} ms)\n", .{ tok.vocab.count(), tok.merges.count(), tok.added.count(), t1 - t0 });
-    try w.flush();
+    // `--tokdump` writes the golden file to stdout, so the banner has to stay out
+    // of it; the counts it carries are checked by `--tokcheck` anyway.
+    if (tokdump == null) {
+        try w.print("tokenizer: {d} vocab / {d} merges / {d} added ({d} ms)\n", .{ tok.vocab.count(), tok.merges.count(), tok.added.count(), t1 - t0 });
+        try w.flush();
+    }
 
     if (tokcheck) |tp| {
         try tokCheck(gpa, io, &tok, tp);
+        return;
+    }
+    if (tokdump) |tp| {
+        try tokDump(gpa, io, &tok, tp, w);
         return;
     }
 
@@ -2699,6 +3648,13 @@ pub fn main(init: std.process.Init) !void {
     const t2 = nowMs(io);
     try w.print("weights: {d} MB, {d} threads ({d} ms)\n", .{ mr[1].len / (1024 * 1024), g_threads, t2 - t1 });
     try w.flush();
+
+    if (g_pretouch) {
+        const t3 = nowMs(io);
+        pretouch(gpa, mr[1]);
+        try w.print("pretouch {d} MB ({d} ms)\n", .{ mr[1].len / (1024 * 1024), nowMs(io) - t3 });
+        try w.flush();
+    }
 
     if (serve) {
         const mc = try gpa.create(ModelChooser);
@@ -2858,6 +3814,13 @@ pub fn main(init: std.process.Init) !void {
 
     const t3 = nowMs(io);
     try profReport(w);
-    try w.print("\nforward {d} ms | total {d} ms\n", .{ t3 - t2, t3 - t0 });
+    try w.print("\nforward {d} ms | total {d} ms", .{ t3 - t2, t3 - t0 });
+    if (peakMem(io)) |pmc| {
+        try w.print(" | peak {d} MB working set, {d} MB commit", .{ pmc.PeakWorkingSetSize / (1024 * 1024), pmc.PeakPagefileUsage / (1024 * 1024) });
+    }
+    if (cpuSeconds()) |cs| {
+        try w.print(" | cpu {d:.2} s", .{cs});
+    }
+    try w.print("\n", .{});
     try w.flush();
 }

@@ -10,6 +10,7 @@ zig-out/
 
 # Agent configuration
 AGENTS.md
+.workbuddy-ai/
 
 # Downloads directory (user files)
 downloads/
@@ -40,3 +41,7 @@ __pycache__/
 # Model checkpoint (643 MB) — download it from the Hugging Face hub instead:
 #   huggingface-cli download convaiinnovations/laya-multilingual --local-dir .
 model.safetensors
+
+# Tokenizer tables built from tokenizer.json on the first run (~38 MB, and
+# rebuilt whenever that file changes) — a cache, not a source file.
+tokenizer/tokenizer.bin

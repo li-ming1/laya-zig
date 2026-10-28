@@ -8,7 +8,8 @@
 > to a working port. It runs end to end and the forward pass is checked against an
 > independent reference implementation, and it has had two serious performance
 > passes (see *Measured* — a Snake decision costs ~170 ms on a laptop CPU, in
-> ~330 MB of memory), but treat it as a **half-finished project**: expect rough
+> ~320 MB of working set and 13 MB of private commit), but treat it as a
+> **half-finished project**: expect rough
 > edges and missing features. It has not been used in anything real.
 >
 > Issues, corrections and pull requests are welcome.
@@ -42,10 +43,11 @@ answering in about a third of a second, offline.
 - **The whole model** — RoPE, alternating global/sliding attention, GLU
   feed-forward, option-marker scoring, act/escalate head, ported layer by layer
   from the upstream reference implementation.
-- **8-wide SIMD, multi-threaded GEMM**, split over output columns so each weight row
-  is streamed from memory exactly once. Every other stage — softmax, RoPE, GLU,
-  the norms, the QKV split — is vectorized and threaded too, which is what brings
-  a Snake decision down to ~170 ms on a laptop CPU.
+- **8-wide SIMD, multi-threaded GEMM** in 16-column blocks, each weight row streamed
+  from memory exactly once and each row of the output written as one full cache
+  line. Every other stage — softmax, RoPE, GLU, the norms, the QKV split — is
+  vectorized and threaded too, which is what brings a Snake decision down to
+  ~170 ms on a laptop CPU.
 - **Verifiable** — three checks, listed below. Not "it seems to run": the forward
   pass is aligned layer by layer.
 
@@ -90,7 +92,36 @@ fast.
 Private bytes are the part the OS cannot take back; the rest is the weight file,
 mapped read-only, so it is just the system file cache and is evictable — which is
 why the idle server drops to 81 MB and why it can never be 614 MB again on a box
-that is short of memory.
+that is short of memory. (The 2026-10-20 pass below takes these numbers further
+still: the idle server is now 13 MB resident and 25 MB of commit.)
+
+A later pass (2026-10-20) took the tokenizer's tables out of the startup path
+entirely. `tokenizer.json` is mapped instead of read, the vocab keys point
+straight into the mapping, the 580k merge keys come from a flat pool, and the
+three tables end up as open-addressed parallel arrays that are written to
+`tokenizer/tokenizer.bin` after the first build (38 MB, invalidated by
+tokenizer.json's size and mtime). Every later run maps that file and is done:
+
+| | before | now |
+|---|---|---|
+| tokenizer load, first run (builds the cache) | ~110 ms | ~230 ms |
+| tokenizer load, every run after that | ~110 ms | **2–3 ms** |
+| one-question decision, total | ~215 ms | **86–90 ms** |
+| one-question decision, committed peak | 84 MB | **13 MB** |
+
+So a one-shot decision is now ~90 ms all in — 2–3 ms tokenizer, ~4 ms weights,
+80–85 ms forward — and the tables never touch private memory: they are pages of
+a mapped file, evictable like the weights. `--profile` splits the one-time build:
+~20 ms vocab, ~50 ms scanning 17 MB, ~50 ms hashing and inserting 840k keys.
+Every run ends by printing its own wall time, peak memory and CPU seconds
+(`cpu 1.09 s` for that question), so cost can be read off a single invocation
+instead of sampled from outside.
+
+The chooser behind `--serve` and `--snake` used to size its scratch buffers for
+`max_len` (1024 tokens) whatever the prompt was; it now grows them to the
+sequence it is about to encode. Idle `--serve` went from 68 MB of commit to
+25 MB (13 MB resident), and a 12-move Snake game prints the same moves with the
+same probabilities as before the change.
 
 Neither column trades accuracy for speed — both print bit-identical probabilities
 and choices. `--selftest` puts the worst GEMM relative error at 7.98e-6 against
@@ -117,6 +148,54 @@ Twelve threads is ~10 % quicker on the two-question demo and no quicker on a
 Snake decision, for 30–60 % more CPU-seconds. Sixteen — one per logical CPU,
 which sounds like the obvious guess — is slower *and* three times the CPU: the
 barrier waits for the slowest SMT straggler.
+
+A 2026-10-20 rerun of `--benchgemm` under ten CPU affinity masks says the same
+thing from the other side: every 8-CPU mask lands between 222 and 256 GFLOPS
+(whether the mask is the low half, the high half, one per core, or all 16) and
+every 4-CPU mask between 74 and 89. Thread *count* is the knob; thread *placement*
+is not.
+
+### A third pass: the GEMM stops being four columns wide
+
+Every kernel up to here kept one accumulator per (token, column) pair, and 16
+architectural vector registers cap that at 2x4 = 8 — exactly the FMA
+latency/throughput product, with nothing left over — at four weight loads per
+eight FMAs. It also re-streamed `x` once per *four* columns, which is ~14 GB of
+`x` traffic for a forward that only reads 239 MB of weights.
+
+The new default kernel (`--kernel 2`) transposes instead. Sixteen weight rows are
+packed k-major into a 384x16 f32 panel (8x8 `@shuffle` transposes, one f16
+conversion per weight element), so one load covers eight *columns* and the
+accumulators span columns rather than k. Six tokens then cost twelve
+accumulators and, per k position, 8 load uops for 12 FMA uops. Two things fall
+out of the wider block: `x` is swept once per 16 columns instead of once per 4
+(3.5 GB instead of 14 GB), and a row of `out` is written as one 64-byte line
+instead of four 16-byte pieces separated by a full sweep of `x`.
+
+`--benchgemm`, same binary, best of 8, rotated A/B — `--kernel 2` against
+`--kernel 1`:
+
+| aggregate GFLOPS | 1 thread | 4 threads | 8 threads |
+|---|---|---|---|
+| packed (2) | **87** | **210** | 286 |
+| block4u (1) | 72 | 174 | **298** |
+| | +20 % | +21 % | -4 % |
+
+The honest part is the last column. On this 28 W part the eight-thread number
+does not move, and `tools/peakflops.zig` says why: a pure-register FMA probe
+reaches 878 GFLOPS on 8 threads in a 17 ms burst and 445–484 GFLOPS sustained —
+the chip gives up half its throughput to its power budget inside one second, which
+is also why whole-forward A/B on this box drifts 2–3x. Ten rotated demo runs,
+medians: **197 ms** packed against **205 ms** block4u. At one and four threads the
+gain is real and repeatable; at eight the clock is the binding constraint, not the
+kernel.
+
+Correctness is re-checked, not assumed: `--selftest` puts the packed path at
+1.1e-5 against f64 (block4u: 8.0e-6 — the packed kernel sums sequentially over k
+instead of into eight partial sums, so it is a slightly different rounding, not a
+worse one), `tools/refcheck.py` still prints PASS with the logits 8e-6 apart and
+the same softmax to four decimals, and the built-in demo prints the same
+probabilities as before.
 
 For reference, the upstream implementation needs ~33 ms per question on a T4.
 This is what a plain CPU costs with zero dependencies.
@@ -147,6 +226,11 @@ tokenizer/tokenizer.json   tokenizer                required
 rl_agent_config.json       temperature etc.         optional, defaults are built in
 encoder/config.json        NOT read — architecture constants are hardcoded
 ```
+
+One more file appears on the first run: `tokenizer/tokenizer.bin` (~38 MB), the
+tokenizer's tables in the shape the runtime wants them. It is a cache — delete it
+whenever you like, it is rebuilt from `tokenizer.json` when the size or mtime
+does not match. On a read-only model directory the build path is simply kept.
 
 ### 3. Build
 
@@ -209,6 +293,7 @@ byte-identical input to upstream.
 | `--json FILE` | use your own state and questions |
 | `--dir DIR` | model directory (default `.`) |
 | `--threads N` | thread count (default `min(cores, 12)`) |
+| `--kernel N` | GEMM kernel: `2` packed 16-column (default), `1` block4u, `0` plain block4 |
 | `--serve [--port N]` | local browser UI (default 8080) |
 | `--snake` | let the model play Snake, one frame per move |
 | `--snake --games N` | N games, summary only |
@@ -217,9 +302,12 @@ byte-identical input to upstream.
 | `--snake --promptv 0..9` | how much of the move the board decides instead of the model (`9` = Hamiltonian cycle: it fills the board whatever the model answers) |
 | `--size N --seed N --max-steps N --delay MS` | Snake options (default 10 / 12345 / `N^4 / 2` / 0) |
 | `--selftest` | SIMD kernels vs f64 |
+| `--benchgemm` | time the GEMM kernel on this model's shapes, no weights needed |
+| `--pretouch` | fault the mapped weight pages in before answering — wins when the file is not in the OS cache, costs ~60 ms when it is |
 | `--profile` | print where each forward spends its time, by stage |
 | `--dumpstats` | per-layer hidden-state fingerprints, for `tools/refcheck.py` |
 | `--tokcheck FILE` | validate the tokenizer against golden samples |
+| `--tokdump FILE` | write that golden file: one JSON line per input line |
 | `--debug` | print marker positions and logits |
 
 ## Architecture
@@ -272,6 +360,16 @@ python -X utf8 tools/refcheck.py _dump.txt
 # 3) UI smoke test: runs src/web/index.html's script against a stubbed DOM/fetch
 #    and drives its buttons (13 checks).
 node tools/web-smoke.js
+
+# 4) Tokenizer vs the official one: 44 strings -- scripts, escapes, added tokens,
+#    whitespace runs, emoji -- whose ids come from the HuggingFace `tokenizers`
+#    library, not from this implementation.
+zig-out/bin/laya.exe --tokcheck tools/tokcheck.jsonl
+
+# 5) Zero-shot accuracy: 23 typed-decision cases with the answer stated in plain
+#    words (zh / en / hi; noul, choice, score), N rounds each through the CLI,
+#    so both accuracy and determinism are visible.
+python -X utf8 tools/accuracy.py 3
 ```
 
 Check 2 is worth calling out, because it is what separates "the model behaves
@@ -372,7 +470,11 @@ src/snake.zig         Snake environment and baseline policies
 src/server.zig        a minimal blocking HTTP/1.1 server for --serve
 src/web/index.html    local UI (one file, embedded into the binary at build time)
 tools/refcheck.py     pure-Python reference implementation (whole-network diff)
+tools/tokcheck.jsonl  44 tokenizer strings with ids from the official tokenizers
+tools/accuracy.py     zero-shot accuracy probe over 23 typed-decision cases
 tools/web-smoke.js    UI script smoke test
+tools/peakflops.zig   pure-register FMA probe: what the chip can sustain, so a GEMM
+                      number has a denominator (burst and sustained are not the same)
 ```
 
 ## Credits
