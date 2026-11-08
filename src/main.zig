@@ -1126,7 +1126,7 @@ fn peakMem(io: std.Io) ?MemCounters {
     var pmc = MemCounters{};
 
     if (builtin.os.tag == .windows) {
-        _ = K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, @sizeOf(MemCounters));
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, @sizeOf(MemCounters)) == 0) return null;
         return pmc;
     }
 
@@ -1137,14 +1137,16 @@ fn peakMem(io: std.Io) ?MemCounters {
     var it = std.mem.splitScalar(u8, status, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trimStart(u8, line, " \t");
+        // /proc reports these in kB, the fields are bytes on Windows, and both
+        // paths print MB downstream -- widen before storing.
         if (std.mem.startsWith(u8, trimmed, "VmHWM:")) {
-            pmc.PeakWorkingSetSize = parseKb(trimmed);
+            pmc.PeakWorkingSetSize = parseKb(trimmed) * 1024;
         } else if (std.mem.startsWith(u8, trimmed, "VmRSS:")) {
-            pmc.WorkingSetSize = parseKb(trimmed);
+            pmc.WorkingSetSize = parseKb(trimmed) * 1024;
         } else if (std.mem.startsWith(u8, trimmed, "VmPeak:")) {
-            pmc.PeakPagefileUsage = parseKb(trimmed);
+            pmc.PeakPagefileUsage = parseKb(trimmed) * 1024;
         } else if (std.mem.startsWith(u8, trimmed, "VmSize:")) {
-            pmc.PagefileUsage = parseKb(trimmed);
+            pmc.PagefileUsage = parseKb(trimmed) * 1024;
         }
     }
 
@@ -3343,6 +3345,28 @@ fn readFile(alloc: Allocator, io: std.Io, path: []const u8) ![]u8 {
     const f = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
     const st = try f.stat(io);
+
+    // Virtual files (procfs, sysfs) report st_size = 0 however much they hold,
+    // so a size-based buffer reads one byte of a multi-KB file. Grow to EOF
+    // instead whenever the size is unknown, and return a slice whose length
+    // matches the allocation so the caller's free is exact.
+    if (st.size == 0) {
+        var data = try alloc.alloc(u8, 4096);
+        errdefer alloc.free(data);
+        var got: usize = 0;
+        while (true) {
+            if (got == data.len) data = try alloc.realloc(data, data.len * 2);
+            const amt = try f.readPositionalAll(io, data[got..], got);
+            if (amt == 0) break;
+            got += amt;
+        }
+        if (got == 0) {
+            alloc.free(data);
+            return data[0..0];
+        }
+        return try alloc.realloc(data, got);
+    }
+
     const buf = try alloc.alloc(u8, @max(@as(usize, @intCast(st.size)), 1));
     const got = try f.readPositionalAll(io, buf, 0);
     return buf[0..got];
